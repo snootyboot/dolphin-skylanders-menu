@@ -13,7 +13,7 @@ env:
 
 jobs:
   build:
-    runs-on: windows-2022
+    runs-on: windows-2025-vs2026
     timeout-minutes: 180
     steps:
       - name: Checkout patch repo
