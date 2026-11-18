@@ -1,0 +1,83 @@
+name: Build Dolphin (Windows x64)
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  DOLPHIN_TAG: 2609b
+
+jobs:
+  build:
+    runs-on: windows-2022
+    timeout-minutes: 180
+    steps:
+      - name: Checkout patch repo
+        uses: actions/checkout@v4
+        with:
+          path: patchrepo
+
+      - name: Clone Dolphin ${{ env.DOLPHIN_TAG }}
+        shell: pwsh
+        run: |
+          git config --global core.longpaths true
+          git clone --branch $env:DOLPHIN_TAG --depth 1 https://github.com/dolphin-emu/dolphin.git dolphin
+          cd dolphin
+          git submodule update --init --recursive --depth 1 --jobs 8
+
+      - name: Apply Skylanders quick menu patch
+        shell: pwsh
+        run: |
+          cd dolphin
+          git apply --whitespace=nowarn ../patchrepo/skylanders-quick-menu.patch
+          git status --short
+
+      - name: Set up MSVC
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Configure
+        shell: pwsh
+        run: |
+          cd dolphin
+          cmake --preset ninja-release-x64 -DENABLE_AUTOUPDATE=OFF -DENABLE_ANALYTICS=OFF -DENABLE_TESTS=OFF
+
+      - name: Build
+        shell: pwsh
+        run: |
+          cd dolphin
+          cmake --build --preset ninja-build-release-x64
+
+      - name: Package
+        shell: pwsh
+        run: |
+          $bin = "dolphin/build/release/x64/Binaries"
+          $out = "Dolphin-2609b-SkylandersMenu"
+          New-Item -ItemType Directory $out | Out-Null
+          # Sys/COPYING/Licenses/qt.conf may be symlinks into the source tree: copy the real files.
+          foreach ($l in "Sys","COPYING","Licenses","qt.conf") { if (Test-Path "$bin/$l") { Remove-Item -LiteralPath "$bin/$l" -Recurse -Force } }
+          Copy-Item "$bin/*" $out -Recurse
+          Copy-Item "dolphin/Data/Sys" "$out/Sys" -Recurse
+          Copy-Item "dolphin/COPYING" "$out/COPYING"
+          Copy-Item "dolphin/LICENSES" "$out/Licenses" -Recurse
+          Copy-Item "dolphin/Source/Core/DolphinQt/qt.conf.win" "$out/qt.conf"
+          Get-ChildItem $out -Recurse -Include *.pdb,*.ilk,*.lib,*.exp | Remove-Item
+          Compress-Archive -Path $out -DestinationPath "$out.zip"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Dolphin-2609b-SkylandersMenu
+          path: Dolphin-2609b-SkylandersMenu.zip
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: build-${{ github.run_number }}
+          name: Dolphin 2609b + Skylanders Menu (build ${{ github.run_number }})
+          files: Dolphin-2609b-SkylandersMenu.zip

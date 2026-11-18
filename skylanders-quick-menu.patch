@@ -1,0 +1,1170 @@
+diff --git a/Source/Core/Core/Core.cpp b/Source/Core/Core/Core.cpp
+index fc614fd..e205ac0 100644
+--- a/Source/Core/Core/Core.cpp
++++ b/Source/Core/Core/Core.cpp
+@@ -1037,6 +1037,25 @@ void UpdateInputGate(bool require_focus, bool require_full_focus)
+   ControlReference::SetInputGate(focus_passes && full_focus_passes);
+ }
+ 
++static std::atomic<bool> s_game_input_blocked = false;
++
++void UpdateGameInputGate(bool require_focus, bool require_full_focus)
++{
++  UpdateInputGate(require_focus, require_full_focus);
++  if (s_game_input_blocked.load(std::memory_order_relaxed))
++    ControlReference::SetInputGate(false);
++}
++
++void SetGameInputBlocked(bool blocked)
++{
++  s_game_input_blocked.store(blocked, std::memory_order_relaxed);
++}
++
++bool IsGameInputBlocked()
++{
++  return s_game_input_blocked.load(std::memory_order_relaxed);
++}
++
+ CPUThreadGuard::CPUThreadGuard(Core::System& system)
+     : m_system(system), m_was_cpu_thread(IsCPUThread())
+ {
+diff --git a/Source/Core/Core/Core.h b/Source/Core/Core/Core.h
+index 7dff8e1..3cdf970 100644
+--- a/Source/Core/Core/Core.h
++++ b/Source/Core/Core/Core.h
+@@ -187,6 +187,13 @@ void DoFrameStep(Core::System& system);
+ 
+ void UpdateInputGate(bool require_focus, bool require_full_focus = false);
+ 
++// Like UpdateInputGate, but also closes the gate while emulated controller input is blocked
++// (e.g. while an on-screen menu that is driven by the same controller is open).
++// Only for the CPU thread's emulated controller polling; hotkeys must keep working.
++void UpdateGameInputGate(bool require_focus, bool require_full_focus = false);
++void SetGameInputBlocked(bool blocked);
++bool IsGameInputBlocked();
++
+ void UpdateTitle(Core::System& system);
+ 
+ }  // namespace Core
+diff --git a/Source/Core/Core/HW/VideoInterface.cpp b/Source/Core/Core/HW/VideoInterface.cpp
+index 42e0f35..a78d335 100644
+--- a/Source/Core/Core/HW/VideoInterface.cpp
++++ b/Source/Core/Core/HW/VideoInterface.cpp
+@@ -952,8 +952,8 @@ void VideoInterfaceManager::Update(u64 ticks)
+     // Throttle before SI poll so user input is taken just before needed. (lower input latency)
+     core_timing.Throttle(ticks);
+ 
+-    Core::UpdateInputGate(!Config::Get(Config::MAIN_INPUT_BACKGROUND_INPUT),
+-                          Config::Get(Config::MAIN_LOCK_CURSOR));
++    Core::UpdateGameInputGate(!Config::Get(Config::MAIN_INPUT_BACKGROUND_INPUT),
++                              Config::Get(Config::MAIN_LOCK_CURSOR));
+     auto& si = m_system.GetSerialInterface();
+     si.UpdateDevices();
+     m_half_line_of_next_si_poll += 2 * si.GetPollXLines();
+diff --git a/Source/Core/Core/HotkeyManager.cpp b/Source/Core/Core/HotkeyManager.cpp
+index 915dc0d..97a695d 100644
+--- a/Source/Core/Core/HotkeyManager.cpp
++++ b/Source/Core/Core/HotkeyManager.cpp
+@@ -6,6 +6,7 @@
+ #include <algorithm>
+ #include <array>
+ #include <string>
++#include <string_view>
+ #include <vector>
+ 
+ #include <fmt/format.h>
+@@ -197,7 +198,14 @@ constexpr std::array<const char*, NUM_HOTKEYS> s_hotkey_labels{{
+     _trans("4x"),
+ 
+     _trans("Show Skylanders Portal"),
+-    _trans("Show Infinity Base")
++    _trans("Show Infinity Base"),
++    _trans("Skylanders Quick Menu"),
++    _trans("Quick Menu Up"),
++    _trans("Quick Menu Down"),
++    _trans("Quick Menu Previous Slot"),
++    _trans("Quick Menu Next Slot"),
++    _trans("Quick Menu Place"),
++    _trans("Quick Menu Close"),
+ }};
+ // clang-format on
+ static_assert(NUM_HOTKEYS == s_hotkey_labels.size(), "Wrong count of hotkey_labels");
+@@ -325,7 +333,7 @@ constexpr std::array<HotkeyGroupInfo, NUM_HOTKEY_GROUPS> s_groups_info = {
+      {_trans("GBA Core"), HK_GBA_LOAD, HK_GBA_RESET, true},
+      {_trans("GBA Volume"), HK_GBA_VOLUME_DOWN, HK_GBA_TOGGLE_MUTE, true},
+      {_trans("GBA Window Size"), HK_GBA_1X, HK_GBA_4X, true},
+-     {_trans("USB Emulation Devices"), HK_SKYLANDERS_PORTAL, HK_INFINITY_BASE}}};
++     {_trans("USB Emulation Devices"), HK_SKYLANDERS_PORTAL, HK_SKYLANDERS_MENU_BACK}}};
+ 
+ HotkeyManager::HotkeyManager()
+ {
+@@ -473,4 +481,22 @@ void HotkeyManager::LoadDefaults(const ControllerInterface& ciface)
+ 
+   set_key_expression(HK_SKYLANDERS_PORTAL, hotkey_string({"Ctrl", "P"}));
+   set_key_expression(HK_INFINITY_BASE, hotkey_string({"Ctrl", "I"}));
++
++  // Skylanders quick menu: bound to the first SDL DualSense (player 1) so it works out of the box.
++  // Rebind under Hotkey Settings > USB Emulation Devices for any other controller.
++  constexpr std::string_view pad = "SDL/0/DualSense Wireless Controller";
++  auto pad_input = [pad](std::string_view control) {
++    return fmt::format("`{}:{}`", pad, control);
++  };
++  set_key_expression(HK_SKYLANDERS_QUICK_MENU, pad_input("Guide"));
++  set_key_expression(HK_SKYLANDERS_MENU_UP,
++                     fmt::format("{} | {}", pad_input("Pad N"), pad_input("Left Y+")));
++  set_key_expression(HK_SKYLANDERS_MENU_DOWN,
++                     fmt::format("{} | {}", pad_input("Pad S"), pad_input("Left Y-")));
++  set_key_expression(HK_SKYLANDERS_MENU_LEFT,
++                     fmt::format("{} | {}", pad_input("Pad W"), pad_input("Left X-")));
++  set_key_expression(HK_SKYLANDERS_MENU_RIGHT,
++                     fmt::format("{} | {}", pad_input("Pad E"), pad_input("Left X+")));
++  set_key_expression(HK_SKYLANDERS_MENU_SELECT, pad_input("Button S"));
++  set_key_expression(HK_SKYLANDERS_MENU_BACK, pad_input("Button E"));
+ }
+diff --git a/Source/Core/Core/HotkeyManager.h b/Source/Core/Core/HotkeyManager.h
+index 6a1b754..1748a4c 100644
+--- a/Source/Core/Core/HotkeyManager.h
++++ b/Source/Core/Core/HotkeyManager.h
+@@ -186,6 +186,13 @@ enum Hotkey
+ 
+   HK_SKYLANDERS_PORTAL,
+   HK_INFINITY_BASE,
++  HK_SKYLANDERS_QUICK_MENU,
++  HK_SKYLANDERS_MENU_UP,
++  HK_SKYLANDERS_MENU_DOWN,
++  HK_SKYLANDERS_MENU_LEFT,
++  HK_SKYLANDERS_MENU_RIGHT,
++  HK_SKYLANDERS_MENU_SELECT,
++  HK_SKYLANDERS_MENU_BACK,
+ 
+   NUM_HOTKEYS,
+ };
+diff --git a/Source/Core/DolphinQt/HotkeyScheduler.cpp b/Source/Core/DolphinQt/HotkeyScheduler.cpp
+index 478454e..16591fe 100644
+--- a/Source/Core/DolphinQt/HotkeyScheduler.cpp
++++ b/Source/Core/DolphinQt/HotkeyScheduler.cpp
+@@ -4,6 +4,7 @@
+ #include "DolphinQt/HotkeyScheduler.h"
+ 
+ #include <algorithm>
++#include <chrono>
+ #include <cmath>
+ #include <thread>
+ 
+@@ -40,6 +41,7 @@
+ #include "InputCommon/ControllerInterface/ControllerInterface.h"
+ 
+ #include "VideoCommon/OnScreenDisplay.h"
++#include "VideoCommon/SkylanderQuickMenu.h"
+ #include "VideoCommon/VideoConfig.h"
+ 
+ constexpr const char* DUBOIS_ALGORITHM_SHADER = "dubois";
+@@ -140,6 +142,105 @@ static void HandleFrameStepHotkeys()
+   }
+ }
+ 
++void HotkeyScheduler::CloseSkylanderQuickMenu()
++{
++  VideoCommon::SkylanderQuickMenu::GetInstance().Close();
++  m_quick_menu_release_pending = true;
++}
++
++void HotkeyScheduler::HandleSkylanderQuickMenu(bool emulation_running)
++{
++  using SteadyClock = std::chrono::steady_clock;
++  using namespace std::chrono_literals;
++  auto& menu = VideoCommon::SkylanderQuickMenu::GetInstance();
++
++  // Read every edge-triggered key on every pass, so a press made while the menu is closed
++  // (e.g. jumping with Cross) can't register as a fresh press the moment it opens.
++  const bool toggle = IsHotkey(HK_SKYLANDERS_QUICK_MENU);
++  const bool select = IsHotkey(HK_SKYLANDERS_MENU_SELECT);
++  const bool back = IsHotkey(HK_SKYLANDERS_MENU_BACK);
++  const bool left = IsHotkey(HK_SKYLANDERS_MENU_LEFT);
++  const bool right = IsHotkey(HK_SKYLANDERS_MENU_RIGHT);
++
++  const auto repeat = [](bool down, RepeatState& state) {
++    if (!down)
++    {
++      state.held = false;
++      return false;
++    }
++    const auto now = SteadyClock::now();
++    if (!state.held)
++    {
++      state.held = true;
++      state.next = now + 400ms;
++      return true;
++    }
++    if (now >= state.next)
++    {
++      state.next = now + 110ms;
++      return true;
++    }
++    return false;
++  };
++  const bool up = repeat(IsHotkey(HK_SKYLANDERS_MENU_UP, true), m_quick_menu_up_repeat);
++  const bool down = repeat(IsHotkey(HK_SKYLANDERS_MENU_DOWN, true), m_quick_menu_down_repeat);
++
++  if (!menu.IsOpen())
++  {
++    if (m_quick_menu_release_pending &&
++        !(IsHotkey(HK_SKYLANDERS_MENU_SELECT, true) || IsHotkey(HK_SKYLANDERS_MENU_BACK, true) ||
++          IsHotkey(HK_SKYLANDERS_QUICK_MENU, true)))
++    {
++      m_quick_menu_release_pending = false;
++      Core::SetGameInputBlocked(false);
++    }
++
++    if (!toggle || !emulation_running)
++      return;
++
++    if (!Config::Get(Config::MAIN_EMULATE_SKYLANDER_PORTAL))
++    {
++      OSD::AddMessage("Skylanders: turn on the emulated portal first "
++                      "(Tools > Emulated Skylanders Portal), then restart the game.",
++                      OSD::Duration::NORMAL);
++      return;
++    }
++
++    Core::SetGameInputBlocked(true);
++    m_quick_menu_release_pending = false;
++    emit SkylanderQuickMenuOpened();
++    menu.Open();
++    return;
++  }
++
++  if (!emulation_running || toggle || back)
++  {
++    CloseSkylanderQuickMenu();
++    return;
++  }
++
++  if (select)
++  {
++    const auto action = menu.Confirm();
++    CloseSkylanderQuickMenu();
++    using ActionType = VideoCommon::SkylanderQuickMenu::ActionType;
++    if (action.type == ActionType::Place)
++      emit SkylanderQuickMenuAction(action.slot, QString::fromStdString(action.path));
++    else if (action.type == ActionType::Remove)
++      emit SkylanderQuickMenuAction(action.slot, QString());
++    return;
++  }
++
++  if (up)
++    menu.MoveCursor(-1);
++  if (down)
++    menu.MoveCursor(1);
++  if (left)
++    menu.SwitchSlot(-1);
++  if (right)
++    menu.SwitchSlot(1);
++}
++
+ void HotkeyScheduler::Run()
+ {
+   Common::SetCurrentThreadName("HotkeyScheduler");
+@@ -192,6 +293,8 @@ void HotkeyScheduler::Run()
+         emit OpenAchievements();
+ #endif  // USE_RETRO_ACHIEVEMENTS
+ 
++      HandleSkylanderQuickMenu(Core::GetState(system) == Core::State::Running);
++
+       if (Core::IsUninitialized(system))
+       {
+         // Only check for Play Recording hotkey when no game is running
+diff --git a/Source/Core/DolphinQt/HotkeyScheduler.h b/Source/Core/DolphinQt/HotkeyScheduler.h
+index 301d1c1..1da338d 100644
+--- a/Source/Core/DolphinQt/HotkeyScheduler.h
++++ b/Source/Core/DolphinQt/HotkeyScheduler.h
+@@ -5,7 +5,10 @@
+ 
+ #include <thread>
+ 
++#include <chrono>
++
+ #include <QObject>
++#include <QString>
+ 
+ #include "Common/CommonTypes.h"
+ #include "Common/Flag.h"
+@@ -71,10 +74,28 @@ signals:
+   void SkylandersPortalHotkey();
+   void InfinityBaseHotkey();
+ 
++  // The in-game Skylanders quick menu was opened and wants a fresh figure list.
++  void SkylanderQuickMenuOpened();
++  // Place the figure at `path` on quick menu slot `slot` (0 or 1), or clear it if `path` is empty.
++  void SkylanderQuickMenuAction(int slot, const QString& path);
++
+ private:
+   void Run();
+   void CheckDebuggingHotkeys();
+   void CheckGBAHotkeys();
++  void HandleSkylanderQuickMenu(bool emulation_running);
++  void CloseSkylanderQuickMenu();
++
++  struct RepeatState
++  {
++    bool held = false;
++    std::chrono::steady_clock::time_point next{};
++  };
++  RepeatState m_quick_menu_up_repeat;
++  RepeatState m_quick_menu_down_repeat;
++  // Emulated controller input stays blocked after the menu closes until the buttons used to
++  // close it are released, so e.g. the confirm press doesn't also reach the game.
++  bool m_quick_menu_release_pending = false;
+ 
+   Common::Flag m_stop_requested;
+   std::thread m_thread;
+diff --git a/Source/Core/DolphinQt/MainWindow.cpp b/Source/Core/DolphinQt/MainWindow.cpp
+index 688ae6f..be7ffbd 100644
+--- a/Source/Core/DolphinQt/MainWindow.cpp
++++ b/Source/Core/DolphinQt/MainWindow.cpp
+@@ -678,6 +678,16 @@ void MainWindow::ConnectHotkeys()
+ 
+   connect(m_hotkey_scheduler, &HotkeyScheduler::SkylandersPortalHotkey, this,
+           &MainWindow::ShowSkylanderPortal);
++  connect(m_hotkey_scheduler, &HotkeyScheduler::SkylanderQuickMenuOpened, this,
++          [this] { GetSkylanderPortalWindow()->QuickMenuPublishEntries(); });
++  connect(m_hotkey_scheduler, &HotkeyScheduler::SkylanderQuickMenuAction, this,
++          [this](int slot, const QString& path) {
++            auto* const window = GetSkylanderPortalWindow();
++            if (path.isEmpty())
++              window->QuickMenuClear(static_cast<u8>(slot));
++            else
++              window->QuickMenuPlace(static_cast<u8>(slot), path);
++          });
+   connect(m_hotkey_scheduler, &HotkeyScheduler::InfinityBaseHotkey, this,
+           &MainWindow::ShowInfinityBase);
+ }
+@@ -1457,12 +1467,18 @@ void MainWindow::ShowFIFOPlayer()
+   m_fifo_window->activateWindow();
+ }
+ 
+-void MainWindow::ShowSkylanderPortal()
++SkylanderPortalWindow* MainWindow::GetSkylanderPortalWindow()
+ {
+   if (!m_skylander_window)
+   {
+     m_skylander_window = new SkylanderPortalWindow();
+   }
++  return m_skylander_window;
++}
++
++void MainWindow::ShowSkylanderPortal()
++{
++  GetSkylanderPortalWindow();
+ 
+   m_skylander_window->show();
+   m_skylander_window->raise();
+diff --git a/Source/Core/DolphinQt/MainWindow.h b/Source/Core/DolphinQt/MainWindow.h
+index 93490ea..bf458ab 100644
+--- a/Source/Core/DolphinQt/MainWindow.h
++++ b/Source/Core/DolphinQt/MainWindow.h
+@@ -179,6 +179,7 @@ private:
+   void ShowNetPlayBrowser();
+   void ShowFIFOPlayer();
+   void ShowSkylanderPortal();
++  SkylanderPortalWindow* GetSkylanderPortalWindow();
+   void ShowInfinityBase();
+   void ShowWiiSpeakWindow();
+   void ShowLogitechMicWindow();
+diff --git a/Source/Core/DolphinQt/SkylanderPortal/SkylanderPortalWindow.cpp b/Source/Core/DolphinQt/SkylanderPortal/SkylanderPortalWindow.cpp
+index b87cc70..7502d29 100644
+--- a/Source/Core/DolphinQt/SkylanderPortal/SkylanderPortalWindow.cpp
++++ b/Source/Core/DolphinQt/SkylanderPortal/SkylanderPortalWindow.cpp
+@@ -10,7 +10,9 @@
+ #include <QComboBox>
+ #include <QCompleter>
+ #include <QDialogButtonBox>
++#include <QDir>
+ #include <QEvent>
++#include <QFileInfo>
+ #include <QGroupBox>
+ #include <QKeyEvent>
+ #include <QKeySequence>
+@@ -27,6 +29,12 @@
+ #include <QThread>
+ #include <QVBoxLayout>
+ 
++#include <algorithm>
++#include <set>
++#include <vector>
++
++#include <fmt/format.h>
++
+ #include "Common/IOFile.h"
+ 
+ #include "Common/FileUtil.h"
+@@ -37,6 +45,9 @@
+ #include "DolphinQt/QtUtils/DolphinFileDialog.h"
+ #include "DolphinQt/Resources.h"
+ #include "DolphinQt/Settings.h"
++
++#include "VideoCommon/OnScreenDisplay.h"
++#include "VideoCommon/SkylanderQuickMenu.h"
+ #include "SkylanderModifyDialog.h"
+ 
+ SkylanderPortalWindow::SkylanderPortalWindow(QWidget* parent) : QWidget(parent)
+@@ -659,9 +670,8 @@ void SkylanderPortalWindow::ClearSlot(u8 slot)
+   {
+     if (!system.GetSkylanderPortal().RemoveSkylander(slot_infos->portal_slot))
+     {
+-      QMessageBox::warning(this, tr("Failed to clear Skylander!"),
+-                           tr("Failed to clear the Skylander from slot %1!").arg(slot),
+-                           QMessageBox::Ok);
++      ShowWarning(tr("Failed to clear Skylander!"),
++                  tr("Failed to clear the Skylander from slot %1!").arg(slot));
+       return;
+     }
+     m_sky_slots[slot].reset();
+@@ -802,20 +812,17 @@ void SkylanderPortalWindow::LoadSkyfilePath(u8 slot, const QString& path)
+   File::IOFile sky_file(path.toStdString(), "r+b");
+   if (!sky_file)
+   {
+-    QMessageBox::warning(this, tr("Failed to open the Skylander file!"),
+-                         tr("Failed to open the Skylander file:\n%1\n\nThe file may already be in "
+-                            "use on the portal.")
+-                             .arg(path),
+-                         QMessageBox::Ok);
++    ShowWarning(tr("Failed to open the Skylander file!"),
++                tr("Failed to open the Skylander file:\n%1\n\nThe file may already be in "
++                   "use on the portal.")
++                    .arg(path));
+     return;
+   }
+   std::array<u8, 0x40 * 0x10> file_data;
+   if (!sky_file.ReadBytes(file_data.data(), file_data.size()))
+   {
+-    QMessageBox::warning(
+-        this, tr("Failed to read the Skylander file!"),
+-        tr("Failed to read the Skylander file:\n%1\n\nThe file was too small.").arg(path),
+-        QMessageBox::Ok);
++    ShowWarning(tr("Failed to read the Skylander file!"),
++                tr("Failed to read the Skylander file:\n%1\n\nThe file was too small.").arg(path));
+     return;
+   }
+ 
+@@ -827,11 +834,12 @@ void SkylanderPortalWindow::LoadSkyfilePath(u8 slot, const QString& path)
+       std::make_unique<IOS::HLE::USB::SkylanderFigure>(std::move(sky_file)));
+   if (portal_slot == 0xFF)
+   {
+-    QMessageBox::warning(this, tr("Failed to load the Skylander file!"),
+-                         tr("Failed to load the Skylander file:\n%1").arg(path), QMessageBox::Ok);
++    ShowWarning(tr("Failed to load the Skylander file!"),
++                tr("Failed to load the Skylander file:\n%1").arg(path));
+     return;
+   }
+-  m_sky_slots[slot] = {portal_slot, id_var.first, id_var.second};
++  m_sky_slots[slot] = {portal_slot, id_var.first, id_var.second,
++                       QFileInfo(path).absoluteFilePath()};
+   RefreshList();
+   UpdateSlotNames();
+ }
+@@ -862,6 +870,223 @@ void SkylanderPortalWindow::UpdateSlotNames()
+ 
+     m_edit_skylanders[i]->setText(display_string);
+   }
++
++  PublishQuickMenuSlots();
++}
++
++void SkylanderPortalWindow::ShowWarning(const QString& title, const QString& text)
++{
++  if (m_quiet)
++  {
++    OSD::AddMessage(QStringLiteral("%1 %2").arg(title, QString(text).replace(QLatin1Char('\n'),
++                                                                             QLatin1Char(' ')))
++                        .toStdString(),
++                    OSD::Duration::NORMAL, OSD::Color::RED);
++    return;
++  }
++  QMessageBox::warning(this, title, text, QMessageBox::Ok);
++}
++
++// In-game quick menu
++
++static u32 QuickMenuElementColor(std::pair<u16, u16> ids)
++{
++  // ImGui packs colors as ABGR.
++  constexpr auto rgb = [](u32 r, u32 g, u32 b) { return 0xFF000000u | (b << 16) | (g << 8) | r; };
++
++  const auto found = IOS::HLE::USB::list_skylanders.find(ids);
++  if (found == IOS::HLE::USB::list_skylanders.end())
++    return rgb(140, 140, 140);
++
++  switch (found->second.element)
++  {
++  case Element::Magic:
++    return rgb(170, 90, 230);
++  case Element::Fire:
++    return rgb(240, 80, 40);
++  case Element::Air:
++    return rgb(140, 210, 255);
++  case Element::Life:
++    return rgb(90, 200, 60);
++  case Element::Undead:
++    return rgb(120, 110, 150);
++  case Element::Earth:
++    return rgb(170, 110, 50);
++  case Element::Water:
++    return rgb(40, 110, 240);
++  case Element::Tech:
++    return rgb(250, 190, 30);
++  case Element::Dark:
++    return rgb(70, 50, 90);
++  case Element::Light:
++    return rgb(255, 245, 170);
++  default:
++    return rgb(140, 140, 140);
++  }
++}
++
++void SkylanderPortalWindow::QuickMenuPublishEntries()
++{
++  using Entry = VideoCommon::SkylanderQuickMenu::Entry;
++  // Sort order: characters, then sidekicks, then magic items/adventure packs, then anything else.
++  const auto group_of = [](std::pair<u16, u16> ids) {
++    const auto found = IOS::HLE::USB::list_skylanders.find(ids);
++    if (found == IOS::HLE::USB::list_skylanders.end())
++      return 3;
++    switch (found->second.type)
++    {
++    case Type::Skylander:
++      return 0;
++    case Type::Mini:
++      return 1;
++    case Type::Item:
++      return 2;
++    default:
++      return 3;
++    }
++  };
++  std::vector<std::pair<int, Entry>> sortable;
++  std::set<std::pair<u16, u16>> owned;
++
++  auto& system = Core::System::GetInstance();
++  const QDir collection(m_collection_path);
++  for (const QFileInfo& file :
++       collection.entryInfoList({QStringLiteral("*.sky"), QStringLiteral("*.bin"),
++                                 QStringLiteral("*.dmp"), QStringLiteral("*.dump")},
++                                QDir::Files))
++  {
++    File::IOFile sky_file(file.filePath().toStdString(), "rb");
++    std::array<u8, 0x40 * 0x10> file_data;
++    if (!sky_file || !sky_file.ReadBytes(file_data.data(), file_data.size()))
++      continue;
++
++    const auto ids = system.GetSkylanderPortal().CalculateIDs(file_data);
++    owned.insert(ids);
++    sortable.emplace_back(group_of(ids), Entry{file.completeBaseName().toStdString(),
++                                               file.absoluteFilePath().toStdString(),
++                                               QuickMenuElementColor(ids), false});
++  }
++
++  // Every Spyro's Adventure figure without a file yet.
++  m_quick_menu_new_files.clear();
++  for (const auto& [ids, sky_data] : IOS::HLE::USB::list_skylanders)
++  {
++    if (sky_data.game != Game::SpyrosAdv || owned.contains(ids))
++      continue;
++
++    const QString path =
++        QFileInfo(collection.filePath(QString::fromUtf8(sky_data.name) + QStringLiteral(".sky")))
++            .absoluteFilePath();
++    if (QFileInfo::exists(path))
++      continue;  // A file with this name exists but holds a different figure; leave it alone.
++
++    m_quick_menu_new_files[path] = ids;
++    sortable.emplace_back(group_of(ids), Entry{sky_data.name, path.toStdString(),
++                                               QuickMenuElementColor(ids), true});
++  }
++
++  std::ranges::sort(sortable, [](const auto& a, const auto& b) {
++    if (a.first != b.first)
++      return a.first < b.first;
++    return QString::fromStdString(a.second.name)
++               .compare(QString::fromStdString(b.second.name), Qt::CaseInsensitive) < 0;
++  });
++
++  std::vector<Entry> entries;
++  entries.reserve(sortable.size());
++  for (auto& item : sortable)
++    entries.push_back(std::move(item.second));
++
++  PublishQuickMenuSlots();
++  VideoCommon::SkylanderQuickMenu::GetInstance().SetEntries(std::move(entries));
++}
++
++void SkylanderPortalWindow::PublishQuickMenuSlots() const
++{
++  auto& menu = VideoCommon::SkylanderQuickMenu::GetInstance();
++  for (int i = 0; i < VideoCommon::SkylanderQuickMenu::NUM_SLOTS; ++i)
++  {
++    const auto& slot = m_sky_slots[i];
++    if (!slot)
++    {
++      menu.SetSlotContents(i, {}, {});
++      continue;
++    }
++
++    std::string name;
++    if (!slot->path.isEmpty())
++    {
++      name = QFileInfo(slot->path).completeBaseName().toStdString();
++    }
++    else
++    {
++      const auto found =
++          IOS::HLE::USB::list_skylanders.find(std::make_pair(slot->m_sky_id, slot->m_sky_var));
++      name = found != IOS::HLE::USB::list_skylanders.end() ? found->second.name : "Unknown";
++    }
++    menu.SetSlotContents(i, std::move(name), slot->path.toStdString());
++  }
++}
++
++void SkylanderPortalWindow::QuickMenuPlace(u8 slot, const QString& path)
++{
++  const QString absolute_path = QFileInfo(path).absoluteFilePath();
++  m_quiet = true;
++
++  // A figure can only be on the portal once: if it's in another slot, move it.
++  for (u8 i = 0; i < MAX_SKYLANDERS; ++i)
++  {
++    if (i != slot && m_sky_slots[i] && m_sky_slots[i]->path == absolute_path)
++      ClearSlot(i);
++  }
++
++  // First use of a figure we don't have a file for: create it in the collection folder.
++  if (!QFileInfo::exists(absolute_path))
++  {
++    const auto pending = m_quick_menu_new_files.find(absolute_path);
++    if (pending == m_quick_menu_new_files.end())
++    {
++      m_quiet = false;
++      return;
++    }
++
++    IOS::HLE::USB::SkylanderFigure figure(absolute_path.toStdString());
++    if (!figure.Create(pending->second.first, pending->second.second))
++    {
++      ShowWarning(tr("Failed to create Skylander file!"), absolute_path);
++      m_quiet = false;
++      return;
++    }
++    figure.Close();
++    m_quick_menu_new_files.erase(pending);
++    OSD::AddMessage(fmt::format("Created {}",
++                                QFileInfo(absolute_path).completeBaseName().toStdString()),
++                    OSD::Duration::SHORT, OSD::Color::CYAN);
++  }
++
++  LoadSkyfilePath(slot, absolute_path);
++  m_quiet = false;
++
++  if (m_sky_slots[slot] && m_sky_slots[slot]->path == absolute_path)
++  {
++    OSD::AddMessage(fmt::format("Slot {}: {}", slot + 1,
++                                QFileInfo(absolute_path).completeBaseName().toStdString()),
++                    OSD::Duration::SHORT, OSD::Color::GREEN);
++  }
++}
++
++void SkylanderPortalWindow::QuickMenuClear(u8 slot)
++{
++  if (!m_sky_slots[slot])
++    return;
++
++  m_quiet = true;
++  ClearSlot(slot);
++  m_quiet = false;
++
++  if (!m_sky_slots[slot])
++    OSD::AddMessage(fmt::format("Slot {}: removed", slot + 1), OSD::Duration::SHORT,
++                    OSD::Color::GREEN);
+ }
+ 
+ // Helpers
+diff --git a/Source/Core/DolphinQt/SkylanderPortal/SkylanderPortalWindow.h b/Source/Core/DolphinQt/SkylanderPortal/SkylanderPortalWindow.h
+index 7724989..d336816 100644
+--- a/Source/Core/DolphinQt/SkylanderPortal/SkylanderPortalWindow.h
++++ b/Source/Core/DolphinQt/SkylanderPortal/SkylanderPortalWindow.h
+@@ -4,6 +4,7 @@
+ #pragma once
+ 
+ #include <array>
++#include <map>
+ #include <optional>
+ 
+ #include <QBrush>
+@@ -35,6 +36,8 @@ struct Skylander
+   u8 portal_slot;
+   u16 m_sky_id;
+   u16 m_sky_var;
++  // Absolute path of the loaded file, used by the in-game quick menu.
++  QString path;
+ };
+ 
+ class SkylanderPortalWindow : public QWidget
+@@ -46,6 +49,12 @@ public:
+ 
+   void RefreshList();
+ 
++  // In-game quick menu (VideoCommon::SkylanderQuickMenu) support. These never show dialogs;
++  // problems are reported as on-screen messages since the user is in-game with a controller.
++  void QuickMenuPublishEntries();
++  void QuickMenuPlace(u8 slot, const QString& path);
++  void QuickMenuClear(u8 slot);
++
+ protected:
+   std::array<QLineEdit*, MAX_SKYLANDERS> m_edit_skylanders;
+   std::array<std::optional<Skylander>, MAX_SKYLANDERS> m_sky_slots;
+@@ -74,6 +83,8 @@ private:
+   void CreateSkyfile(const QString& path, bool load_after);
+   void LoadSkyfilePath(u8 slot, const QString& path);
+   void UpdateSlotNames();
++  void PublishQuickMenuSlots() const;
++  void ShowWarning(const QString& title, const QString& text);
+ 
+   // Helpers
+   bool PassesFilter(const QString& name, u16 id, u16 var) const;
+@@ -108,4 +119,8 @@ private:
+   QListWidget* m_skylander_list;
+   u16 m_sky_id = 0;
+   u16 m_sky_var = 0;
++  // When set, warnings go to the on-screen display instead of message boxes.
++  bool m_quiet = false;
++  // Quick menu figures that don't have a file yet: absolute path -> (id, variant).
++  std::map<QString, std::pair<u16, u16>> m_quick_menu_new_files;
+ };
+diff --git a/Source/Core/VideoCommon/CMakeLists.txt b/Source/Core/VideoCommon/CMakeLists.txt
+index 69a0968..615592b 100644
+--- a/Source/Core/VideoCommon/CMakeLists.txt
++++ b/Source/Core/VideoCommon/CMakeLists.txt
+@@ -126,6 +126,8 @@ add_library(videocommon
+   OnScreenUI.cpp
+   OnScreenUI.h
+   OnScreenUIKeyMap.h
++  SkylanderQuickMenu.cpp
++  SkylanderQuickMenu.h
+   OpcodeDecoding.cpp
+   OpcodeDecoding.h
+   PerfQueryBase.cpp
+diff --git a/Source/Core/VideoCommon/OnScreenUI.cpp b/Source/Core/VideoCommon/OnScreenUI.cpp
+index 209e96c..fd59946 100644
+--- a/Source/Core/VideoCommon/OnScreenUI.cpp
++++ b/Source/Core/VideoCommon/OnScreenUI.cpp
+@@ -26,6 +26,7 @@
+ #include "VideoCommon/NetPlayGolfUI.h"
+ #include "VideoCommon/OnScreenDisplay.h"
+ #include "VideoCommon/PerformanceMetrics.h"
++#include "VideoCommon/SkylanderQuickMenu.h"
+ #include "VideoCommon/Present.h"
+ #include "VideoCommon/Statistics.h"
+ #include "VideoCommon/VertexManagerBase.h"
+@@ -422,6 +423,7 @@ void OnScreenUI::Finalize()
+   DrawDebugText();
+   OSD::DrawMessages();
+   DrawChallengesAndLeaderboards();
++  SkylanderQuickMenu::GetInstance().Display();
+   ImGui::Render();
+ 
+   // Check for font changes
+diff --git a/Source/Core/VideoCommon/SkylanderQuickMenu.cpp b/Source/Core/VideoCommon/SkylanderQuickMenu.cpp
+new file mode 100644
+index 0000000..47936d7
+--- /dev/null
++++ b/Source/Core/VideoCommon/SkylanderQuickMenu.cpp
+@@ -0,0 +1,297 @@
++// Copyright 2026 Dolphin Emulator Project
++// SPDX-License-Identifier: GPL-2.0-or-later
++
++#include "VideoCommon/SkylanderQuickMenu.h"
++
++#include <algorithm>
++#include <utility>
++
++#include <fmt/format.h>
++#include <imgui.h>
++
++namespace VideoCommon
++{
++namespace
++{
++constexpr int VISIBLE_ROWS = 9;
++
++constexpr ImU32 COLOR_TITLE = IM_COL32(255, 205, 80, 255);
++constexpr ImU32 COLOR_TEXT = IM_COL32(235, 235, 240, 255);
++constexpr ImU32 COLOR_DIM = IM_COL32(150, 150, 165, 255);
++constexpr ImU32 COLOR_ACCENT = IM_COL32(255, 170, 40, 255);
++constexpr ImU32 COLOR_SLOT_BG = IM_COL32(40, 40, 55, 255);
++constexpr ImU32 COLOR_SLOT_SELECTED_BG = IM_COL32(120, 70, 10, 255);
++constexpr ImU32 COLOR_ROW_SELECTED_BG = IM_COL32(255, 170, 40, 70);
++constexpr ImU32 COLOR_REMOVE = IM_COL32(255, 110, 100, 255);
++}  // namespace
++
++SkylanderQuickMenu& SkylanderQuickMenu::GetInstance()
++{
++  static SkylanderQuickMenu instance;
++  return instance;
++}
++
++void SkylanderQuickMenu::Open()
++{
++  std::lock_guard lk(m_mutex);
++  PlaceCursorOnCurrentFigure();
++  m_place_cursor_pending = true;
++  m_open.store(true, std::memory_order_relaxed);
++}
++
++void SkylanderQuickMenu::Close()
++{
++  m_open.store(false, std::memory_order_relaxed);
++}
++
++void SkylanderQuickMenu::SetEntries(std::vector<Entry> entries)
++{
++  std::lock_guard lk(m_mutex);
++  m_entries = std::move(entries);
++  if (m_place_cursor_pending)
++  {
++    PlaceCursorOnCurrentFigure();
++    m_place_cursor_pending = false;
++  }
++  m_cursor = std::clamp(m_cursor, 0, GetRowCount() - 1);
++  m_scroll_to_cursor = true;
++}
++
++void SkylanderQuickMenu::SetSlotContents(int slot, std::string name, std::string path)
++{
++  if (slot < 0 || slot >= NUM_SLOTS)
++    return;
++
++  std::lock_guard lk(m_mutex);
++  m_slots[slot] = {std::move(name), std::move(path)};
++}
++
++void SkylanderQuickMenu::MoveCursor(int delta)
++{
++  std::lock_guard lk(m_mutex);
++  const int rows = GetRowCount();
++  m_cursor = ((m_cursor + delta) % rows + rows) % rows;
++  m_scroll_to_cursor = true;
++}
++
++void SkylanderQuickMenu::SwitchSlot(int delta)
++{
++  std::lock_guard lk(m_mutex);
++  m_selected_slot = ((m_selected_slot + delta) % NUM_SLOTS + NUM_SLOTS) % NUM_SLOTS;
++}
++
++SkylanderQuickMenu::Action SkylanderQuickMenu::Confirm()
++{
++  std::lock_guard lk(m_mutex);
++  Action action;
++  action.slot = m_selected_slot;
++
++  if (m_cursor == 0)
++  {
++    if (!m_slots[m_selected_slot].name.empty())
++      action.type = ActionType::Remove;
++    return action;
++  }
++
++  const auto index = static_cast<size_t>(m_cursor - 1);
++  if (index >= m_entries.size())
++    return action;
++
++  // Already sitting in this slot: nothing to do.
++  if (m_entries[index].path == m_slots[m_selected_slot].path)
++    return action;
++
++  action.type = ActionType::Place;
++  action.path = m_entries[index].path;
++  return action;
++}
++
++void SkylanderQuickMenu::PlaceCursorOnCurrentFigure()
++{
++  const std::string& current = m_slots[m_selected_slot].path;
++  m_cursor = m_entries.empty() ? 0 : 1;
++  if (!current.empty())
++  {
++    const auto it = std::ranges::find(m_entries, current, &Entry::path);
++    if (it != m_entries.end())
++      m_cursor = static_cast<int>(std::distance(m_entries.begin(), it)) + 1;
++  }
++  m_scroll_to_cursor = true;
++}
++
++void SkylanderQuickMenu::Display()
++{
++  if (!IsOpen())
++    return;
++
++  std::lock_guard lk(m_mutex);
++
++  const ImGuiStyle& style = ImGui::GetStyle();
++  const ImVec2 display = ImGui::GetIO().DisplaySize;
++  const float global_scale = std::max(style.FontScaleMain * style.FontScaleDpi, 0.01f);
++  // Aim for roughly 1/34th of the screen height per line of text, never smaller than the OSD.
++  const float font_base = std::max(style.FontSizeBase, display.y / 34.0f / global_scale);
++  ImGui::PushFont(nullptr, font_base);
++
++  const float font = ImGui::GetFontSize();
++  const float pad = font * 0.6f;
++  const float width = std::min(display.x * 0.9f, font * 20.0f);
++  const float row_height = font * 1.5f;
++
++  ImGui::SetNextWindowPos(ImVec2(display.x * 0.5f, display.y * 0.5f), ImGuiCond_Always,
++                          ImVec2(0.5f, 0.5f));
++  ImGui::SetNextWindowBgAlpha(0.93f);
++  ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(pad, pad));
++  ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, font * 0.5f);
++  ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(pad * 0.5f, pad * 0.5f));
++  ImGui::PushStyleColor(ImGuiCol_WindowBg, IM_COL32(18, 18, 28, 255));
++  ImGui::PushStyleColor(ImGuiCol_Border, COLOR_ACCENT);
++
++  constexpr ImGuiWindowFlags window_flags =
++      ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove |
++      ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoNav |
++      ImGuiWindowFlags_NoInputs | ImGuiWindowFlags_NoFocusOnAppearing |
++      ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoScrollbar;
++
++  if (ImGui::Begin("Skylanders Quick Menu", nullptr, window_flags))
++  {
++    ImDrawList* draw = ImGui::GetWindowDrawList();
++
++    // Title
++    {
++      const char* title = "PORTAL OF POWER";
++      const float title_w = ImGui::CalcTextSize(title).x;
++      ImGui::SetCursorPosX((width + pad * 2.0f - title_w) * 0.5f);
++      ImGui::PushStyleColor(ImGuiCol_Text, COLOR_TITLE);
++      ImGui::TextUnformatted(title);
++      ImGui::PopStyleColor();
++    }
++
++    // Slot selector
++    {
++      const float gap = pad * 0.5f;
++      const float slot_w = (width - gap) * 0.5f;
++      const float slot_h = font * 2.6f;
++      const ImVec2 origin = ImGui::GetCursorScreenPos();
++      for (int i = 0; i < NUM_SLOTS; ++i)
++      {
++        const bool selected = i == m_selected_slot;
++        const ImVec2 p0(origin.x + i * (slot_w + gap), origin.y);
++        const ImVec2 p1(p0.x + slot_w, p0.y + slot_h);
++        draw->AddRectFilled(p0, p1, selected ? COLOR_SLOT_SELECTED_BG : COLOR_SLOT_BG,
++                            font * 0.3f);
++        if (selected)
++          draw->AddRect(p0, p1, COLOR_ACCENT, font * 0.3f, 0, std::max(2.0f, font * 0.1f));
++
++        const std::string label = fmt::format("Slot {}", i + 1);
++        draw->AddText(ImVec2(p0.x + pad * 0.6f, p0.y + font * 0.2f),
++                      selected ? COLOR_ACCENT : COLOR_DIM, label.c_str());
++
++        const bool empty = m_slots[i].name.empty();
++        const char* name = empty ? "Empty" : m_slots[i].name.c_str();
++        ImGui::PushClipRect(p0, p1, true);
++        draw->AddText(ImVec2(p0.x + pad * 0.6f, p0.y + font * 1.3f),
++                      empty ? COLOR_DIM : COLOR_TEXT, name);
++        ImGui::PopClipRect();
++      }
++      ImGui::Dummy(ImVec2(width, slot_h));
++    }
++
++    // Figure list
++    {
++      const int rows = GetRowCount();
++      const float list_h = row_height * std::min(rows, VISIBLE_ROWS) + pad * 0.5f;
++      ImGui::PushStyleColor(ImGuiCol_ChildBg, IM_COL32(10, 10, 16, 255));
++      ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(0, 0));
++      if (ImGui::BeginChild("figures", ImVec2(width, list_h), ImGuiChildFlags_None,
++                            ImGuiWindowFlags_NoInputs | ImGuiWindowFlags_NoNav |
++                                ImGuiWindowFlags_NoScrollbar))
++      {
++        ImDrawList* list_draw = ImGui::GetWindowDrawList();
++        const float text_y = (row_height - font) * 0.5f;
++
++        for (int row = 0; row < rows; ++row)
++        {
++          const ImVec2 p0 = ImGui::GetCursorScreenPos();
++          const ImVec2 p1(p0.x + width, p0.y + row_height);
++          const bool selected = row == m_cursor;
++
++          if (selected)
++          {
++            list_draw->AddRectFilled(p0, p1, COLOR_ROW_SELECTED_BG, font * 0.2f);
++            list_draw->AddRectFilled(p0, ImVec2(p0.x + font * 0.2f, p1.y), COLOR_ACCENT);
++            if (m_scroll_to_cursor)
++            {
++              ImGui::SetScrollHereY(0.5f);
++              m_scroll_to_cursor = false;
++            }
++          }
++
++          if (row == 0)
++          {
++            const bool slot_empty = m_slots[m_selected_slot].name.empty();
++            const std::string text = fmt::format("Remove from Slot {}", m_selected_slot + 1);
++            list_draw->AddText(ImVec2(p0.x + font * 0.8f, p0.y + text_y),
++                               slot_empty ? COLOR_DIM : COLOR_REMOVE, text.c_str());
++          }
++          else
++          {
++            const Entry& entry = m_entries[row - 1];
++            const float sq = font * 0.7f;
++            const ImVec2 sq0(p0.x + font * 0.8f, p0.y + (row_height - sq) * 0.5f);
++            list_draw->AddRectFilled(sq0, ImVec2(sq0.x + sq, sq0.y + sq), entry.color,
++                                     sq * 0.25f);
++            list_draw->AddText(ImVec2(sq0.x + sq + font * 0.5f, p0.y + text_y),
++                               selected ? IM_COL32_WHITE : COLOR_TEXT, entry.name.c_str());
++
++            if (entry.is_new)
++            {
++              const char* tag = "NEW";
++              const float tag_w = ImGui::CalcTextSize(tag).x;
++              list_draw->AddText(ImVec2(p1.x - tag_w - font * 0.6f, p0.y + text_y), COLOR_DIM,
++                                 tag);
++            }
++
++            for (int s = 0; s < NUM_SLOTS; ++s)
++            {
++              if (m_slots[s].path.empty() || m_slots[s].path != entry.path)
++                continue;
++              const std::string tag = fmt::format("SLOT {}", s + 1);
++              const float tag_w = ImGui::CalcTextSize(tag.c_str()).x;
++              list_draw->AddText(ImVec2(p1.x - tag_w - font * 0.6f, p0.y + text_y),
++                                 COLOR_ACCENT, tag.c_str());
++            }
++          }
++
++          ImGui::Dummy(ImVec2(width, row_height));
++        }
++
++        if (m_entries.empty())
++        {
++          ImGui::PushStyleColor(ImGuiCol_Text, COLOR_DIM);
++          ImGui::TextUnformatted("  No Skylanders found.");
++          ImGui::PopStyleColor();
++        }
++      }
++      ImGui::EndChild();
++      ImGui::PopStyleVar();
++      ImGui::PopStyleColor();
++    }
++
++    // Controls hint
++    {
++      ImGui::PushStyleColor(ImGuiCol_Text, COLOR_DIM);
++      ImGui::PushFont(nullptr, font_base * 0.75f);
++      ImGui::TextUnformatted("Up/Down: Browse    Left/Right: Slot");
++      ImGui::TextUnformatted("Cross: Place    Circle / PS: Close");
++      ImGui::PopFont();
++      ImGui::PopStyleColor();
++    }
++  }
++  ImGui::End();
++
++  ImGui::PopStyleColor(2);
++  ImGui::PopStyleVar(3);
++  ImGui::PopFont();
++}
++}  // namespace VideoCommon
+diff --git a/Source/Core/VideoCommon/SkylanderQuickMenu.h b/Source/Core/VideoCommon/SkylanderQuickMenu.h
+new file mode 100644
+index 0000000..695e8b6
+--- /dev/null
++++ b/Source/Core/VideoCommon/SkylanderQuickMenu.h
+@@ -0,0 +1,87 @@
++// Copyright 2026 Dolphin Emulator Project
++// SPDX-License-Identifier: GPL-2.0-or-later
++
++#pragma once
++
++#include <array>
++#include <atomic>
++#include <mutex>
++#include <string>
++#include <vector>
++
++#include "Common/CommonTypes.h"
++
++namespace VideoCommon
++{
++// In-game, controller-driven menu for placing Skylanders on the emulated Portal of Power.
++// Input is fed in from the hotkey thread, the figure list and slot contents are fed in from
++// the UI thread, and the menu is drawn on the video thread as part of the on-screen UI.
++class SkylanderQuickMenu
++{
++public:
++  static constexpr int NUM_SLOTS = 2;
++
++  struct Entry
++  {
++    std::string name;
++    std::string path;
++    u32 color = 0xFFFFFFFF;  // ImGui ABGR
++    // No file yet: one will be created in the collection folder when it's first placed.
++    bool is_new = false;
++  };
++
++  enum class ActionType
++  {
++    None,
++    Place,
++    Remove,
++  };
++
++  struct Action
++  {
++    ActionType type = ActionType::None;
++    int slot = 0;
++    std::string path;
++  };
++
++  static SkylanderQuickMenu& GetInstance();
++
++  void Open();
++  void Close();
++  bool IsOpen() const { return m_open.load(std::memory_order_relaxed); }
++
++  // UI thread
++  void SetEntries(std::vector<Entry> entries);
++  void SetSlotContents(int slot, std::string name, std::string path);
++
++  // Hotkey thread
++  void MoveCursor(int delta);
++  void SwitchSlot(int delta);
++  Action Confirm();
++
++  // Video thread, between ImGui::NewFrame and ImGui::Render
++  void Display();
++
++private:
++  struct SlotContents
++  {
++    std::string name;
++    std::string path;
++  };
++
++  SkylanderQuickMenu() = default;
++
++  // Row 0 is "Remove", rows 1..N are the entries.
++  int GetRowCount() const { return static_cast<int>(m_entries.size()) + 1; }
++  void PlaceCursorOnCurrentFigure();
++
++  mutable std::mutex m_mutex;
++  std::atomic<bool> m_open{false};
++  std::vector<Entry> m_entries;
++  std::array<SlotContents, NUM_SLOTS> m_slots;
++  int m_selected_slot = 0;
++  int m_cursor = 0;
++  bool m_scroll_to_cursor = false;
++  bool m_place_cursor_pending = false;
++};
++}  // namespace VideoCommon
