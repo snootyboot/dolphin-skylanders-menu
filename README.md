@@ -12,16 +12,25 @@ controller-driven menu for swapping Skylanders on the emulated Portal of Power.
 | Button | Action |
 |---|---|
 | PS | Open / close the menu |
-| D-pad or left stick ↑↓ | Browse figures (hold to scroll) |
-| D-pad or left stick ←→ | Choose Slot 1 / Slot 2 |
-| Cross | Place the highlighted figure on the chosen slot (or remove, on the top row) |
+| D-pad or left stick | Move around the grid (hold to scroll) |
+| L1 / R1 | Change slot: Slot 1, Slot 2, Slot 3 (Items) |
+| Cross | Place the highlighted figure on the selected slot |
+| Triangle | Remove the figure from the selected slot |
 | Circle | Close |
 
-The game keeps running behind the menu, but it ignores controller input until the menu closes.
-Picking a figure that's already in the other slot moves it over.
-The list shows every Spyro's Adventure figure (characters, sidekicks, magic items, adventure packs)
-plus any other files in your Skylanders collection folder (`%AppData%\Dolphin Emulator\Skylanders`).
-Figures marked **NEW** have no file yet; one is created in that folder the first time you place it.
+Slots 1 and 2 list characters and sidekicks: a **Recent** row first (the newest figure of each
+element plus the newest sidekick, 9 at most), then one group per element, then sidekicks.
+Slot 3 lists magic items and adventure packs (and traps, if you have Trap Team files).
+
+Every Spyro's Adventure figure is listed. Figures marked **NEW** have no file yet; one is created
+in your Skylanders folder (`%AppData%\Dolphin Emulator\Skylanders`) the first time you place it.
+Placing a figure that's already in another slot moves it over.
+
+**Portraits:** put `Portraits\<Name>.png` (transparent background) in the Skylanders folder and
+it's drawn over the figure's element colour. Figures without one show their initials.
+Recently used figures are remembered in `QuickMenuRecent.txt` in the same folder.
+
+The game keeps running behind the menu but ignores controller input until it closes.
 
 The buttons are rebindable under **Options → Hotkey Settings → USB Emulation Devices**.
 Requires **Tools → Emulated Skylanders Portal → Emulate Skylander Portal** to be on.
