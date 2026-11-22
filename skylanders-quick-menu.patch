@@ -148,6 +148,67 @@ index 6a1b754..d8e1878 100644
  
    NUM_HOTKEYS,
  };
+diff --git a/Source/Core/Core/IOS/USB/Emulated/Skylanders/SkylanderFigure.cpp b/Source/Core/Core/IOS/USB/Emulated/Skylanders/SkylanderFigure.cpp
+index 60edb51..221fd9b 100644
+--- a/Source/Core/Core/IOS/USB/Emulated/Skylanders/SkylanderFigure.cpp
++++ b/Source/Core/Core/IOS/USB/Emulated/Skylanders/SkylanderFigure.cpp
+@@ -3,6 +3,7 @@
+ 
+ #include "Core/IOS/USB/Emulated/Skylanders/SkylanderFigure.h"
+ 
++#include <algorithm>
+ #include <array>
+ #include <cstring>
+ #include <span>
+@@ -167,6 +168,34 @@ bool SkylanderFigure::Create(u16 sky_id, u16 sky_var,
+   Save();
+   return true;
+ }
++void SkylanderFigure::CopyFromWithVariant(const SkylanderFigure& source, u16 variant_id)
++{
++  std::array<u8, FIGURE_SIZE> decrypted = {};
++  source.DecryptFigure(&decrypted);
++
++  // New header: same NUID/IDs, new variant, recomputed header checksum. The encryption keys are
++  // derived from the header, so set it before encrypting.
++  m_data = source.m_data;
++  memcpy(&m_data[0x1C], &variant_id, sizeof(variant_id));
++  ComputeChecksumType0(m_data.data(), m_data.data() + 0x1E);
++  memcpy(decrypted.data(), m_data.data(), 0x20);
++
++  Encrypt(decrypted);
++
++  // Blocks that were never written are stored as all zeroes rather than encrypted zeroes; keep
++  // them that way so the copy matches the original exactly.
++  for (u32 block = 8; block < BLOCK_COUNT; ++block)
++  {
++    if ((block + 1) % 4 == 0)
++      continue;
++    const auto begin = source.m_data.begin() + block * BLOCK_SIZE;
++    if (std::all_of(begin, begin + BLOCK_SIZE, [](u8 b) { return b == 0; }))
++      std::fill_n(m_data.begin() + block * BLOCK_SIZE, BLOCK_SIZE, u8{0});
++  }
++
++  Save();
++}
++
+ void SkylanderFigure::Save()
+ {
+   m_sky_file.Seek(0, File::SeekOrigin::Begin);
+diff --git a/Source/Core/Core/IOS/USB/Emulated/Skylanders/SkylanderFigure.h b/Source/Core/Core/IOS/USB/Emulated/Skylanders/SkylanderFigure.h
+index 0e652d6..53345aa 100644
+--- a/Source/Core/Core/IOS/USB/Emulated/Skylanders/SkylanderFigure.h
++++ b/Source/Core/Core/IOS/USB/Emulated/Skylanders/SkylanderFigure.h
+@@ -72,6 +72,9 @@ public:
+   void DecryptFigure(std::array<u8, FIGURE_SIZE>* dest) const;
+   FigureData GetData() const;
+   void SetData(FigureData* data);
++  // Makes this figure an exact copy of `source` (same NUID and save data) but with a different
++  // variant ID, re-encrypting the data for the new header. Saves to this figure's file.
++  void CopyFromWithVariant(const SkylanderFigure& source, u16 variant_id);
+ 
+ private:
+   void PopulateSectorTrailers();
 diff --git a/Source/Core/DolphinQt/HotkeyScheduler.cpp b/Source/Core/DolphinQt/HotkeyScheduler.cpp
 index 478454e..f972d36 100644
 --- a/Source/Core/DolphinQt/HotkeyScheduler.cpp
@@ -390,7 +451,7 @@ index 93490ea..bf458ab 100644
    void ShowWiiSpeakWindow();
    void ShowLogitechMicWindow();
 diff --git a/Source/Core/DolphinQt/SkylanderPortal/SkylanderPortalWindow.cpp b/Source/Core/DolphinQt/SkylanderPortal/SkylanderPortalWindow.cpp
-index b87cc70..ff80c7a 100644
+index b87cc70..71a2dba 100644
 --- a/Source/Core/DolphinQt/SkylanderPortal/SkylanderPortalWindow.cpp
 +++ b/Source/Core/DolphinQt/SkylanderPortal/SkylanderPortalWindow.cpp
 @@ -10,7 +10,10 @@
@@ -404,7 +465,7 @@ index b87cc70..ff80c7a 100644
  #include <QGroupBox>
  #include <QKeyEvent>
  #include <QKeySequence>
-@@ -27,6 +30,12 @@
+@@ -27,16 +30,26 @@
  #include <QThread>
  #include <QVBoxLayout>
  
@@ -417,7 +478,11 @@ index b87cc70..ff80c7a 100644
  #include "Common/IOFile.h"
  
  #include "Common/FileUtil.h"
-@@ -37,6 +46,9 @@
+ #include "Core/Config/MainSettings.h"
++#include "Core/ConfigManager.h"
+ #include "Core/IOS/USB/Emulated/Skylanders/Skylander.h"
+ #include "Core/System.h"
+ 
  #include "DolphinQt/QtUtils/DolphinFileDialog.h"
  #include "DolphinQt/Resources.h"
  #include "DolphinQt/Settings.h"
@@ -427,7 +492,7 @@ index b87cc70..ff80c7a 100644
  #include "SkylanderModifyDialog.h"
  
  SkylanderPortalWindow::SkylanderPortalWindow(QWidget* parent) : QWidget(parent)
-@@ -659,9 +671,8 @@ void SkylanderPortalWindow::ClearSlot(u8 slot)
+@@ -659,9 +672,8 @@ void SkylanderPortalWindow::ClearSlot(u8 slot)
    {
      if (!system.GetSkylanderPortal().RemoveSkylander(slot_infos->portal_slot))
      {
@@ -439,7 +504,26 @@ index b87cc70..ff80c7a 100644
        return;
      }
      m_sky_slots[slot].reset();
-@@ -802,20 +813,17 @@ void SkylanderPortalWindow::LoadSkyfilePath(u8 slot, const QString& path)
+@@ -684,6 +696,18 @@ void SkylanderPortalWindow::OnEmulationStateChanged(Core::State state)
+   const bool running = state != Core::State::Uninitialized;
+ 
+   m_enabled_checkbox->setEnabled(!running);
++
++  // A different game booted: take figures that belong to the other game off the portal before
++  // it reads them, so e.g. Giants never writes to a Spyro's Adventure character.
++  if (state == Core::State::Running)
++  {
++    const std::string game_id = SConfig::GetInstance().GetGameID();
++    if (game_id != m_quick_menu_game_id)
++    {
++      m_quick_menu_game_id = game_id;
++      PutAwayFiguresFromOtherGame();
++    }
++  }
+ }
+ 
+ void SkylanderPortalWindow::UpdateCurrentIDs()
+@@ -802,20 +826,17 @@ void SkylanderPortalWindow::LoadSkyfilePath(u8 slot, const QString& path)
    File::IOFile sky_file(path.toStdString(), "r+b");
    if (!sky_file)
    {
@@ -466,7 +550,7 @@ index b87cc70..ff80c7a 100644
      return;
    }
  
-@@ -827,11 +835,12 @@ void SkylanderPortalWindow::LoadSkyfilePath(u8 slot, const QString& path)
+@@ -827,11 +848,12 @@ void SkylanderPortalWindow::LoadSkyfilePath(u8 slot, const QString& path)
        std::make_unique<IOS::HLE::USB::SkylanderFigure>(std::move(sky_file)));
    if (portal_slot == 0xFF)
    {
@@ -482,7 +566,7 @@ index b87cc70..ff80c7a 100644
    RefreshList();
    UpdateSlotNames();
  }
-@@ -862,6 +871,303 @@ void SkylanderPortalWindow::UpdateSlotNames()
+@@ -862,6 +884,481 @@ void SkylanderPortalWindow::UpdateSlotNames()
  
      m_edit_skylanders[i]->setText(display_string);
    }
@@ -590,18 +674,79 @@ index b87cc70..ff80c7a 100644
 +  }
 +}
 +
-+QString SkylanderPortalWindow::QuickMenuRecentFile() const
++namespace
 +{
-+  return QDir(m_collection_path).filePath(QStringLiteral("QuickMenuRecent.txt"));
++enum class QuickMenuGame
++{
++  SpyrosAdventure,
++  Giants,
++};
++
++QuickMenuGame CurrentQuickMenuGame()
++{
++  if (SConfig::GetInstance().GetGameID().starts_with("SKY"))
++    return QuickMenuGame::Giants;
++  return QuickMenuGame::SpyrosAdventure;
 +}
 +
++const QString S2_SUFFIX = QStringLiteral(" (S2)");
++
++struct ScannedFigure
++{
++  QFileInfo file;
++  std::pair<u16, u16> ids;
++};
++
++std::vector<ScannedFigure> ScanFigureFolder(const QDir& folder)
++{
++  std::vector<ScannedFigure> figures;
++  auto& portal = Core::System::GetInstance().GetSkylanderPortal();
++  for (const QFileInfo& file :
++       folder.entryInfoList({QStringLiteral("*.sky"), QStringLiteral("*.bin"),
++                             QStringLiteral("*.dmp"), QStringLiteral("*.dump")},
++                            QDir::Files))
++  {
++    File::IOFile sky_file(file.filePath().toStdString(), "rb");
++    std::array<u8, 0x40 * 0x10> file_data;
++    if (!sky_file || !sky_file.ReadBytes(file_data.data(), file_data.size()))
++      continue;
++    figures.push_back({file, portal.CalculateIDs(file_data)});
++  }
++  return figures;
++}
++
++// True once the figure has every Spyro's Adventure ability: a chosen path, the 4 basic upgrades,
++// the 3 path upgrades and the Soul Gem.
++bool HasAllSpyrosAdventureUpgrades(const QString& path)
++{
++  File::IOFile file(path.toStdString(), "rb");
++  if (!file)
++    return false;
++
++  const IOS::HLE::USB::SkylanderFigure figure(std::move(file));
++  std::array<u8, IOS::HLE::USB::FIGURE_SIZE> data{};
++  figure.DecryptFigure(&data);
++
++  // The data area with the newer sequence number is the current one.
++  const size_t area = ((data[0x89] + 1U) != data[0x249]) ? 0x80 : 0x240;
++  const u32 upgrades = u32{data[area + 0x10]} | (u32{data[area + 0x11]} << 8) |
++                       (u32{data[area + 0x12]} << 16);
++  // Bit 0: on a path, bits 2-5: upgrades, bits 6-8: path upgrades, bit 9: Soul Gem.
++  constexpr u32 ALL_UPGRADES = 0x3FD;
++  return (upgrades & ALL_UPGRADES) == ALL_UPGRADES;
++}
++}  // namespace
++
 +// Each line: <unix seconds><tab><file name>
-+std::map<QString, s64> SkylanderPortalWindow::LoadQuickMenuRecent() const
++std::map<QString, s64> SkylanderPortalWindow::LoadQuickMenuRecent(const QString& folder) const
 +{
 +  std::map<QString, s64> recent;
 +  std::string contents;
-+  if (!File::ReadFileToString(QuickMenuRecentFile().toStdString(), contents))
++  if (!File::ReadFileToString(
++          QDir(folder).filePath(QStringLiteral("QuickMenuRecent.txt")).toStdString(), contents))
++  {
 +    return recent;
++  }
 +
 +  for (const QString& line : QString::fromStdString(contents).split(QLatin1Char('\n')))
 +  {
@@ -619,33 +764,47 @@ index b87cc70..ff80c7a 100644
 +
 +void SkylanderPortalWindow::RecordQuickMenuUse(const QString& path) const
 +{
-+  auto recent = LoadQuickMenuRecent();
++  const QString folder = QFileInfo(path).absolutePath();
++  auto recent = LoadQuickMenuRecent(folder);
 +  recent[QFileInfo(path).fileName()] = QDateTime::currentSecsSinceEpoch();
 +
 +  std::string contents;
 +  for (const auto& [name, when] : recent)
 +    contents += fmt::format("{}\t{}\n", when, name.toStdString());
-+  File::WriteStringToFile(QuickMenuRecentFile().toStdString(), contents);
++  File::WriteStringToFile(
++      QDir(folder).filePath(QStringLiteral("QuickMenuRecent.txt")).toStdString(), contents);
 +}
 +
 +void SkylanderPortalWindow::QuickMenuPublishEntries()
 +{
 +  using Entry = VideoCommon::SkylanderQuickMenu::Entry;
-+  std::vector<Entry> entries;
-+  std::set<std::pair<u16, u16>> owned;
++  using Category = VideoCommon::SkylanderQuickMenu::Category;
 +
-+  const QDir collection(m_collection_path);
-+  const QDir portraits(collection.filePath(QStringLiteral("Portraits")));
-+  const auto recent = LoadQuickMenuRecent();
++  const QuickMenuGame game = CurrentQuickMenuGame();
++  const QDir base(m_collection_path);
++  const QDir portraits(base.filePath(QStringLiteral("Portraits")));
++  QDir game_folder = base;
++  if (game == QuickMenuGame::Giants)
++  {
++    base.mkpath(QStringLiteral("Giants"));
++    game_folder = QDir(base.filePath(QStringLiteral("Giants")));
++  }
 +
-+  const auto make_entry = [&](const QString& name, const QString& path, std::pair<u16, u16> ids,
-+                              bool is_new) {
++  // Series 2 figures fall back to their Series 1 portrait.
++  const auto portrait_for = [&portraits](const QString& name) {
++    QString image = portraits.filePath(name + QStringLiteral(".png"));
++    if (!QFileInfo::exists(image) && name.endsWith(S2_SUFFIX))
++      image = portraits.filePath(name.chopped(S2_SUFFIX.size()) + QStringLiteral(".png"));
++    return QFileInfo::exists(image) ? image.toStdString() : std::string();
++  };
++
++  const auto make_entry = [&portrait_for](const QString& name, const QString& path,
++                                          std::pair<u16, u16> ids, bool is_new,
++                                          const std::map<QString, s64>& recent) {
 +    Entry entry;
 +    entry.name = name.toStdString();
 +    entry.path = path.toStdString();
-+    const QString image = portraits.filePath(name + QStringLiteral(".png"));
-+    if (QFileInfo::exists(image))
-+      entry.image_path = image.toStdString();
++    entry.image_path = portrait_for(name);
 +    entry.color = QuickMenuElementColor(ids);
 +    entry.category = QuickMenuCategory(ids);
 +    if (const auto it = recent.find(QFileInfo(path).fileName()); it != recent.end())
@@ -654,37 +813,90 @@ index b87cc70..ff80c7a 100644
 +    return entry;
 +  };
 +
-+  auto& system = Core::System::GetInstance();
-+  for (const QFileInfo& file :
-+       collection.entryInfoList({QStringLiteral("*.sky"), QStringLiteral("*.bin"),
-+                                 QStringLiteral("*.dmp"), QStringLiteral("*.dump")},
-+                                QDir::Files))
-+  {
-+    File::IOFile sky_file(file.filePath().toStdString(), "rb");
-+    std::array<u8, 0x40 * 0x10> file_data;
-+    if (!sky_file || !sky_file.ReadBytes(file_data.data(), file_data.size()))
-+      continue;
++  std::vector<Entry> entries;
++  m_quick_menu_new_files.clear();
 +
-+    const auto ids = system.GetSkylanderPortal().CalculateIDs(file_data);
-+    owned.insert(ids);
-+    entries.push_back(make_entry(file.completeBaseName(), file.absoluteFilePath(), ids, false));
++  // Files that belong to the running game.
++  const auto game_recent = LoadQuickMenuRecent(game_folder.absolutePath());
++  std::set<std::pair<u16, u16>> owned;
++  for (const ScannedFigure& figure : ScanFigureFolder(game_folder))
++  {
++    owned.insert(figure.ids);
++    entries.push_back(make_entry(figure.file.completeBaseName(), figure.file.absoluteFilePath(),
++                                 figure.ids, false, game_recent));
 +  }
 +
-+  // Every Spyro's Adventure figure without a file yet.
-+  m_quick_menu_new_files.clear();
-+  for (const auto& [ids, sky_data] : IOS::HLE::USB::list_skylanders)
-+  {
-+    if (sky_data.game != Game::SpyrosAdv || owned.contains(ids))
-+      continue;
-+
++  const auto add_new = [&](const IOS::HLE::USB::SkyData& sky_data, std::pair<u16, u16> ids,
++                           const QDir& folder, const QString& copy_from,
++                           const std::map<QString, s64>& recent) {
 +    const QString name = QString::fromUtf8(sky_data.name);
 +    const QString path =
-+        QFileInfo(collection.filePath(name + QStringLiteral(".sky"))).absoluteFilePath();
++        QFileInfo(folder.filePath(name + QStringLiteral(".sky"))).absoluteFilePath();
 +    if (QFileInfo::exists(path))
-+      continue;  // A file with this name exists but holds a different figure; leave it alone.
++      return;  // A file with this name exists but holds a different figure; leave it alone.
++    m_quick_menu_new_files[path] = {ids, copy_from};
++    entries.push_back(make_entry(name, path, ids, true, recent));
++  };
 +
-+    m_quick_menu_new_files[path] = ids;
-+    entries.push_back(make_entry(name, path, ids, true));
++  if (game == QuickMenuGame::SpyrosAdventure)
++  {
++    // Every Spyro's Adventure figure without a file yet.
++    for (const auto& [ids, sky_data] : IOS::HLE::USB::list_skylanders)
++    {
++      if (sky_data.game == Game::SpyrosAdv && !owned.contains(ids))
++        add_new(sky_data, ids, game_folder, {}, game_recent);
++    }
++  }
++  else
++  {
++    // Spyro's Adventure characters and sidekicks stay in that game. Its magic items and
++    // adventure packs hold no progress, so they're shared.
++    const auto ssa_figures = ScanFigureFolder(base);
++    const auto ssa_recent = LoadQuickMenuRecent(base.absolutePath());
++    std::set<std::pair<u16, u16>> ssa_owned;
++    for (const ScannedFigure& figure : ssa_figures)
++    {
++      ssa_owned.insert(figure.ids);
++      if (QuickMenuCategory(figure.ids) == Category::Item)
++      {
++        entries.push_back(make_entry(figure.file.completeBaseName(),
++                                     figure.file.absoluteFilePath(), figure.ids, false,
++                                     ssa_recent));
++      }
++    }
++
++    for (const auto& [ids, sky_data] : IOS::HLE::USB::list_skylanders)
++    {
++      if (sky_data.game == Game::SpyrosAdv)
++      {
++        if (QuickMenuCategory(ids) == Category::Item && !ssa_owned.contains(ids))
++          add_new(sky_data, ids, base, {}, ssa_recent);
++        continue;
++      }
++      if (sky_data.game != Game::Giants || owned.contains(ids))
++        continue;
++
++      const QString name = QString::fromUtf8(sky_data.name);
++      QString copy_from;
++      if (name.endsWith(S2_SUFFIX))
++      {
++        // Series 2 appears once its Series 1 figure has every Spyro's Adventure upgrade, and
++        // starts as an exact copy of it.
++        const auto s1 = std::ranges::find_if(ssa_figures, [&ids](const ScannedFigure& figure) {
++          return figure.ids == std::make_pair(ids.first, u16{0});
++        });
++        if (s1 == ssa_figures.end() || !HasAllSpyrosAdventureUpgrades(s1->file.filePath()))
++          continue;
++        copy_from = s1->file.absoluteFilePath();
++      }
++      else if (name.contains(QLatin1Char('(')) &&
++               !name.endsWith(QStringLiteral(" (Sidekick)")) && portrait_for(name).empty())
++      {
++        continue;  // Other variants (Legendary, LightCore, Stone...) only with a portrait.
++      }
++
++      add_new(sky_data, ids, game_folder, copy_from, game_recent);
++    }
 +  }
 +
 +  std::ranges::sort(entries, [](const Entry& a, const Entry& b) {
@@ -694,6 +906,31 @@ index b87cc70..ff80c7a 100644
 +
 +  PublishQuickMenuSlots();
 +  VideoCommon::SkylanderQuickMenu::GetInstance().SetEntries(std::move(entries));
++}
++
++void SkylanderPortalWindow::PutAwayFiguresFromOtherGame()
++{
++  const QuickMenuGame game = CurrentQuickMenuGame();
++  const QString base = QDir(m_collection_path).absolutePath();
++  const QString giants = QDir(base).filePath(QStringLiteral("Giants"));
++
++  m_quiet = true;
++  for (u8 slot = 0; slot < MAX_SKYLANDERS; ++slot)
++  {
++    if (!m_sky_slots[slot] || m_sky_slots[slot]->path.isEmpty())
++      continue;
++
++    const QString folder = QFileInfo(m_sky_slots[slot]->path).absolutePath();
++    const auto ids = std::make_pair(m_sky_slots[slot]->m_sky_id, m_sky_slots[slot]->m_sky_var);
++    const bool put_away =
++        game == QuickMenuGame::Giants ?
++            (folder == base &&
++             QuickMenuCategory(ids) != VideoCommon::SkylanderQuickMenu::Category::Item) :
++            folder == giants;
++    if (put_away)
++      ClearSlot(slot);
++  }
++  m_quiet = false;
 +}
 +
 +void SkylanderPortalWindow::PublishQuickMenuSlots() const
@@ -745,18 +982,43 @@ index b87cc70..ff80c7a 100644
 +      return;
 +    }
 +
-+    IOS::HLE::USB::SkylanderFigure figure(absolute_path.toStdString());
-+    if (!figure.Create(pending->second.first, pending->second.second))
++    const QuickMenuNewFile& new_file = pending->second;
++    bool created = false;
++    if (!new_file.copy_from.isEmpty())
++    {
++      File::IOFile source_file(new_file.copy_from.toStdString(), "rb");
++      if (source_file)
++      {
++        const IOS::HLE::USB::SkylanderFigure source(std::move(source_file));
++        IOS::HLE::USB::SkylanderFigure figure(File::IOFile(absolute_path.toStdString(), "w+b"));
++        if (figure.FileIsOpen())
++        {
++          figure.CopyFromWithVariant(source, new_file.ids.second);
++          figure.Close();
++          created = true;
++        }
++      }
++    }
++    else
++    {
++      IOS::HLE::USB::SkylanderFigure figure(absolute_path.toStdString());
++      created = figure.Create(new_file.ids.first, new_file.ids.second);
++      figure.Close();
++    }
++
++    if (!created)
 +    {
 +      ShowWarning(tr("Failed to create Skylander file!"), absolute_path);
 +      m_quiet = false;
 +      return;
 +    }
-+    figure.Close();
++
++    const std::string created_name = QFileInfo(absolute_path).completeBaseName().toStdString();
++    OSD::AddMessage(new_file.copy_from.isEmpty() ?
++                        fmt::format("Created {}", created_name) :
++                        fmt::format("Created {} from your Series 1 figure", created_name),
++                    OSD::Duration::NORMAL, OSD::Color::CYAN);
 +    m_quick_menu_new_files.erase(pending);
-+    OSD::AddMessage(fmt::format("Created {}",
-+                                QFileInfo(absolute_path).completeBaseName().toStdString()),
-+                    OSD::Duration::SHORT, OSD::Color::CYAN);
 +  }
 +
 +  LoadSkyfilePath(slot, absolute_path);
@@ -787,7 +1049,7 @@ index b87cc70..ff80c7a 100644
  
  // Helpers
 diff --git a/Source/Core/DolphinQt/SkylanderPortal/SkylanderPortalWindow.h b/Source/Core/DolphinQt/SkylanderPortal/SkylanderPortalWindow.h
-index 7724989..ce24bda 100644
+index 7724989..07d137c 100644
 --- a/Source/Core/DolphinQt/SkylanderPortal/SkylanderPortalWindow.h
 +++ b/Source/Core/DolphinQt/SkylanderPortal/SkylanderPortalWindow.h
 @@ -4,6 +4,7 @@
@@ -825,21 +1087,29 @@ index 7724989..ce24bda 100644
    void LoadSkyfilePath(u8 slot, const QString& path);
    void UpdateSlotNames();
 +  void PublishQuickMenuSlots() const;
-+  QString QuickMenuRecentFile() const;
-+  std::map<QString, s64> LoadQuickMenuRecent() const;
++  std::map<QString, s64> LoadQuickMenuRecent(const QString& folder) const;
 +  void RecordQuickMenuUse(const QString& path) const;
++  void PutAwayFiguresFromOtherGame();
 +  void ShowWarning(const QString& title, const QString& text);
  
    // Helpers
    bool PassesFilter(const QString& name, u16 id, u16 var) const;
-@@ -108,4 +122,8 @@ private:
+@@ -108,4 +122,16 @@ private:
    QListWidget* m_skylander_list;
    u16 m_sky_id = 0;
    u16 m_sky_var = 0;
 +  // When set, warnings go to the on-screen display instead of message boxes.
 +  bool m_quiet = false;
-+  // Quick menu figures that don't have a file yet: absolute path -> (id, variant).
-+  std::map<QString, std::pair<u16, u16>> m_quick_menu_new_files;
++  // Quick menu figures that don't have a file yet, keyed by the absolute path they'll get.
++  struct QuickMenuNewFile
++  {
++    std::pair<u16, u16> ids;
++    // If set, the new file starts as a copy of this figure (Series 1 -> Series 2).
++    QString copy_from;
++  };
++  std::map<QString, QuickMenuNewFile> m_quick_menu_new_files;
++  // Game ID the quick menu last saw boot, to put away figures that belong to another game.
++  std::string m_quick_menu_game_id;
  };
 diff --git a/Source/Core/VideoCommon/CMakeLists.txt b/Source/Core/VideoCommon/CMakeLists.txt
 index 69a0968..615592b 100644
@@ -884,10 +1154,10 @@ index 209e96c..3e0cf09 100644
    // Check for font changes
 diff --git a/Source/Core/VideoCommon/SkylanderQuickMenu.cpp b/Source/Core/VideoCommon/SkylanderQuickMenu.cpp
 new file mode 100644
-index 0000000..920ed28
+index 0000000..bef52f4
 --- /dev/null
 +++ b/Source/Core/VideoCommon/SkylanderQuickMenu.cpp
-@@ -0,0 +1,650 @@
+@@ -0,0 +1,656 @@
 +// Copyright 2026 Dolphin Emulator Project
 +// SPDX-License-Identifier: GPL-2.0-or-later
 +
@@ -965,9 +1235,15 @@ index 0000000..920ed28
 +  }
 +}
 +
++// Characters (one group per element). Sidekicks count as items.
++bool IsCharacterCategory(Category category)
++{
++  return category < Category::Sidekick || category == Category::Other;
++}
++
 +bool IsRecentCategory(Category category)
 +{
-+  return category <= Category::Sidekick;
++  return category < Category::Sidekick;
 +}
 +
 +std::string Initials(const std::string& name)
@@ -1109,11 +1385,12 @@ index 0000000..920ed28
 +  if (m_selected_slot == ITEM_SLOT)
 +  {
 +    add_section(CategoryTitle(Category::Item), indices_in(Category::Item));
++    add_section(CategoryTitle(Category::Sidekick), indices_in(Category::Sidekick));
 +    add_section(CategoryTitle(Category::Trap), indices_in(Category::Trap));
 +  }
 +  else
 +  {
-+    // Recent: the most recently used figure of each element, plus the most recent sidekick.
++    // Recent: the most recently used figure of each element.
 +    std::array<int, static_cast<size_t>(Category::Count)> newest;
 +    newest.fill(-1);
 +    for (int i = 0; i < static_cast<int>(m_entries.size()); ++i)
@@ -1141,7 +1418,7 @@ index 0000000..920ed28
 +    for (int c = 0; c < static_cast<int>(Category::Count); ++c)
 +    {
 +      const auto category = static_cast<Category>(c);
-+      if (category != Category::Item && category != Category::Trap)
++      if (IsCharacterCategory(category))
 +        add_section(CategoryTitle(category), indices_in(category));
 +    }
 +  }
@@ -1247,8 +1524,7 @@ index 0000000..920ed28
 +  const Entry& entry = m_entries[index];
 +  if (entry.path == m_slots[m_selected_slot].path)
 +    return action;  // Already sitting in this slot.
-+  const bool is_item = entry.category == Category::Item || entry.category == Category::Trap;
-+  if ((m_selected_slot == ITEM_SLOT) != is_item)
++  if ((m_selected_slot == ITEM_SLOT) == IsCharacterCategory(entry.category))
 +    return action;
 +
 +  action.type = ActionType::Place;
@@ -1540,7 +1816,7 @@ index 0000000..920ed28
 +}  // namespace VideoCommon
 diff --git a/Source/Core/VideoCommon/SkylanderQuickMenu.h b/Source/Core/VideoCommon/SkylanderQuickMenu.h
 new file mode 100644
-index 0000000..962604f
+index 0000000..4db6ca4
 --- /dev/null
 +++ b/Source/Core/VideoCommon/SkylanderQuickMenu.h
 @@ -0,0 +1,135 @@
@@ -1569,7 +1845,7 @@ index 0000000..962604f
 +class SkylanderQuickMenu
 +{
 +public:
-+  // Slots 0 and 1 hold characters/sidekicks; slot 2 holds magic items, adventure packs and traps.
++  // Slots 0 and 1 hold characters; slot 2 holds magic items, adventure packs, sidekicks and traps.
 +  static constexpr int NUM_SLOTS = 3;
 +  static constexpr int ITEM_SLOT = 2;
 +
