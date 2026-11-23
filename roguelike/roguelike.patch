@@ -1,11 +1,13 @@
 diff --git a/Source/Core/Core/CMakeLists.txt b/Source/Core/Core/CMakeLists.txt
-index 56c8dba..6730d28 100644
+index 56c8dba..c2111c9 100644
 --- a/Source/Core/Core/CMakeLists.txt
 +++ b/Source/Core/Core/CMakeLists.txt
-@@ -139,6 +139,10 @@ add_library(core
+@@ -139,6 +139,12 @@ add_library(core
    Host.h
    HotkeyManager.cpp
    HotkeyManager.h
++  Roguelike/Run.cpp
++  Roguelike/Run.h
 +  RoguelikeDev/DevTools.cpp
 +  RoguelikeDev/DevTools.h
 +  RoguelikeDev/DevToolsParse.cpp
@@ -13,7 +15,7 @@ index 56c8dba..6730d28 100644
    HW/AddressSpace.cpp
    HW/AddressSpace.h
    HW/AudioInterface.cpp
-@@ -702,6 +706,7 @@ PRIVATE
+@@ -702,6 +708,7 @@ PRIVATE
    LZO::LZO
    LZ4::LZ4
    ZLIB::ZLIB
@@ -35,26 +37,50 @@ index f0cc851..893bce4 100644
  const Info<bool> MAIN_EMULATE_INFINITY_BASE{
      {System::Main, "EmulatedUSBDevices", "EmulateInfinityBase"}, false};
 diff --git a/Source/Core/Core/Core.cpp b/Source/Core/Core/Core.cpp
-index e205ac0..3128223 100644
+index e205ac0..601bcee 100644
 --- a/Source/Core/Core/Core.cpp
 +++ b/Source/Core/Core/Core.cpp
-@@ -69,6 +69,7 @@
+@@ -69,6 +69,8 @@
  #include "Core/PowerPC/GDBStub.h"
  #include "Core/PowerPC/JitInterface.h"
  #include "Core/PowerPC/PowerPC.h"
++#include "Core/Roguelike/Run.h"
 +#include "Core/RoguelikeDev/DevTools.h"
  #include "Core/State.h"
  #include "Core/System.h"
  #include "Core/WiiRoot.h"
-@@ -150,6 +151,8 @@ void FrameUpdateOnCPUThread()
+@@ -150,6 +152,9 @@ void FrameUpdateOnCPUThread()
  
  void OnFrameEnd(Core::System& system)
  {
 +  RoguelikeDev::DevTools::GetInstance().OnFrameEnd(system);
++  Roguelike::Run::GetInstance().OnFrameEnd(system);
 +
  #ifdef USE_MEMORYWATCHER
    if (s_memory_watcher)
    {
+diff --git a/Source/Core/Core/HW/DVD/DVDInterface.cpp b/Source/Core/Core/HW/DVD/DVDInterface.cpp
+index ce8cb72..73b272a 100644
+--- a/Source/Core/Core/HW/DVD/DVDInterface.cpp
++++ b/Source/Core/Core/HW/DVD/DVDInterface.cpp
+@@ -20,6 +20,7 @@
+ #include "Common/Logging/Log.h"
+ 
+ #include "Core/AchievementManager.h"
++#include "Core/Roguelike/Run.h"
+ #include "Core/Config/MainSettings.h"
+ #include "Core/Config/SessionSettings.h"
+ #include "Core/Core.h"
+@@ -754,6 +755,9 @@ bool DVDInterface::ExecuteReadCommand(u64 dvd_offset, u32 output_address, u32 dv
+     *interrupt_type = DIInterruptType::TCINT;
+   }
+ 
++  Roguelike::Run::GetInstance().OnDiscRead(dvd_offset, dvd_length,
++                                             partition != DiscIO::PARTITION_NONE);
++
+   if (dvd_length > output_length)
+   {
+     WARN_LOG_FMT(DVDINTERFACE, "Detected an attempt to read more data from the DVD "
 diff --git a/Source/Core/Core/HotkeyManager.cpp b/Source/Core/Core/HotkeyManager.cpp
 index 89e9130..69c4356 100644
 --- a/Source/Core/Core/HotkeyManager.cpp
@@ -131,6 +157,519 @@ index d8e1878..629574d 100644
  
    NUM_HOTKEY_GROUPS,
  };
+diff --git a/Source/Core/Core/Roguelike/Run.cpp b/Source/Core/Core/Roguelike/Run.cpp
+new file mode 100644
+index 0000000..a0b21b3
+--- /dev/null
++++ b/Source/Core/Core/Roguelike/Run.cpp
+@@ -0,0 +1,368 @@
++// Copyright 2026 Dolphin Emulator Project
++// SPDX-License-Identifier: GPL-2.0-or-later
++
++#include "Core/Roguelike/Run.h"
++
++#include <algorithm>
++#include <optional>
++#include <string_view>
++
++#include <fmt/format.h>
++
++#include "Common/Logging/Log.h"
++#include "Core/ConfigManager.h"
++#include "Core/Core.h"
++#include "Core/HW/Memmap.h"
++#include "Core/PowerPC/MMU.h"
++#include "Core/System.h"
++
++namespace Roguelike
++{
++namespace
++{
++constexpr std::uint32_t FST_POINTER_ADDRESS = 0x80000038;
++constexpr std::uint32_t MEM1_BASE = 0x80000000;
++constexpr std::uint32_t MAX_FST_ENTRIES = 20000;
++constexpr std::uint32_t PARSE_RETRY_INTERVAL = 30;  // frames
++// A hub load this soon after entering a level is treated as part of the load, not a return.
++constexpr std::uint64_t MIN_FRAMES_IN_LEVEL = 60 * 20;
++
++std::optional<std::uint32_t> ReadU32(const Core::CPUThreadGuard& guard, std::uint32_t address)
++{
++  const auto result = PowerPC::MMU::HostTryRead<u32>(guard, address);
++  if (!result)
++    return std::nullopt;
++  return result->value;
++}
++
++bool InMem1(Core::System& system, std::uint32_t address, std::uint32_t size)
++{
++  const std::uint32_t mem1_size = system.GetMemory().GetRamSizeReal();
++  return address >= MEM1_BASE && address - MEM1_BASE <= mem1_size &&
++         size <= mem1_size - (address - MEM1_BASE);
++}
++
++std::string_view StemOf(std::string_view name)
++{
++  const auto dot = name.rfind('.');
++  return dot == std::string_view::npos ? name : name.substr(0, dot);
++}
++
++std::string_view ExtensionOf(std::string_view name)
++{
++  const auto dot = name.rfind('.');
++  return dot == std::string_view::npos ? std::string_view{} : name.substr(dot + 1);
++}
++
++bool EqualsNoCase(std::string_view a, std::string_view b)
++{
++  return a.size() == b.size() && std::equal(a.begin(), a.end(), b.begin(), [](char x, char y) {
++           return (x | 0x20) == (y | 0x20);
++         });
++}
++
++bool StartsWith(std::string_view text, std::string_view prefix)
++{
++  return text.size() >= prefix.size() && text.substr(0, prefix.size()) == prefix;
++}
++}  // namespace
++
++bool IsRoguelikeGame()
++{
++  return SConfig::GetInstance().GetGameID() == RUN_GAME_ID;
++}
++
++Run& Run::GetInstance()
++{
++  static Run instance;
++  return instance;
++}
++
++Run::Run()
++{
++  m_state_hook = Core::AddOnStateChangedCallback([this](Core::State state) {
++    // Closing or rebooting the game ends the run (no saving, by design).
++    if (state == Core::State::Uninitialized || state == Core::State::Starting)
++    {
++      std::lock_guard lk(m_mutex);
++      ResetLocked();
++    }
++  });
++}
++
++void Run::ResetLocked()
++{
++  m_fst_valid = false;
++  m_fst_address = 0;
++  m_parse_retry_frames = 0;
++  m_error.clear();
++  m_level_files.clear();
++  m_entrance = {};
++  m_targets = {};
++  m_is_wii = false;
++  m_complete = false;
++  m_loop = 0;
++  m_level = 0;
++  m_in_level = false;
++  m_frames_in_level = 0;
++  m_last_stem.clear();
++}
++
++void Run::OnFrameEnd(Core::System& system)
++{
++  if (!IsRoguelikeGame())
++    return;
++
++  std::lock_guard lk(m_mutex);
++
++  if (m_in_level)
++    ++m_frames_in_level;
++
++  if (!m_fst_valid)
++  {
++    if (m_parse_retry_frames > 0)
++    {
++      --m_parse_retry_frames;
++      return;
++    }
++    m_parse_retry_frames = PARSE_RETRY_INTERVAL;
++
++    std::optional<std::uint32_t> fst_address;
++    {
++      const Core::CPUThreadGuard guard(system);
++      fst_address = ReadU32(guard, FST_POINTER_ADDRESS);
++    }
++    if (!fst_address || !InMem1(system, *fst_address, 12))
++      return;
++    if (!ParseFstLocked(system, *fst_address))
++      return;
++  }
++
++  ApplySwapLocked(system);
++}
++
++bool Run::ParseFstLocked(Core::System& system, std::uint32_t fst_address)
++{
++  const Core::CPUThreadGuard guard(system);
++
++  const auto root_word0 = ReadU32(guard, fst_address);
++  const auto count = ReadU32(guard, fst_address + 8);
++  if (!root_word0 || !count || (*root_word0 >> 24) != 1 || *count < 2 ||
++      *count > MAX_FST_ENTRIES || !InMem1(system, fst_address, *count * 12))
++  {
++    return false;
++  }
++
++  const std::uint32_t string_table = fst_address + *count * 12;
++  std::vector<FstFile> files;
++  Pair entrance;
++  std::array<Pair, RUN_LEVEL_COUNT> targets{};
++
++  for (std::uint32_t i = 1; i < *count; ++i)
++  {
++    const std::uint32_t entry = fst_address + i * 12;
++    const auto word0 = ReadU32(guard, entry);
++    const auto word1 = ReadU32(guard, entry + 4);
++    const auto word2 = ReadU32(guard, entry + 8);
++    if (!word0 || !word1 || !word2)
++      return false;
++    if ((*word0 >> 24) != 0)  // directory
++      continue;
++
++    const std::uint32_t name_offset = *word0 & 0x00FFFFFF;
++    const std::uint32_t name_address = string_table + name_offset;
++    if (!InMem1(system, name_address, 1))
++      return false;
++    const auto name = PowerPC::MMU::HostTryReadString(guard, name_address);
++    if (!name)
++      return false;
++    const std::string_view name_view = name->value;
++    if (!StartsWith(name_view, "Level_"))
++      continue;
++
++    FstFile file;
++    file.entry_address = entry;
++    file.name_offset = name_offset;
++    file.data_start = static_cast<std::uint64_t>(*word1) << (system.IsWii() ? 2 : 0);
++    file.data_end = file.data_start + *word2;
++    file.stem = std::string(StemOf(name_view));
++    const std::string_view ext = ExtensionOf(name_view);
++    const int index = static_cast<int>(files.size());
++
++    const auto assign = [&](Pair& pair) {
++      if (EqualsNoCase(ext, "arc"))
++        pair.arc = index;
++      else if (EqualsNoCase(ext, "bld"))
++        pair.bld = index;
++    };
++    if (file.stem == RUN_ENTRANCE_STEM)
++      assign(entrance);
++    for (int l = 0; l < RUN_LEVEL_COUNT; ++l)
++    {
++      if (file.stem == RUN_LEVELS[l].file_stem)
++        assign(targets[l]);
++    }
++    files.push_back(std::move(file));
++  }
++
++  const auto complete = [](const Pair& p) { return p.arc >= 0 && p.bld >= 0; };
++  std::string error;
++  if (!complete(entrance))
++    error = fmt::format("{} not found in the disc file table.", RUN_ENTRANCE_STEM);
++  for (int l = 0; l < RUN_LEVEL_COUNT && error.empty(); ++l)
++  {
++    if (!complete(targets[l]))
++      error = fmt::format("{} not found in the disc file table.", RUN_LEVELS[l].file_stem);
++  }
++  if (!error.empty())
++  {
++    if (error != m_error)
++      ERROR_LOG_FMT(CORE, "Roguelike: {}", error);
++    m_error = std::move(error);
++    return false;
++  }
++
++  m_level_files = std::move(files);
++  m_entrance = entrance;
++  m_targets = targets;
++  m_fst_address = fst_address;
++  m_is_wii = system.IsWii();
++  m_fst_valid = true;
++  m_error.clear();
++  INFO_LOG_FMT(CORE, "Roguelike: file table at {:08x}, {} level files", fst_address,
++               m_level_files.size());
++  return true;
++}
++
++void Run::ApplySwapLocked(Core::System& system)
++{
++  // Desired name offset for every managed entry: original, except the entrance and the current
++  // target swap names while the run is active.
++  struct Write
++  {
++    std::uint32_t address;
++    std::uint32_t value;
++  };
++  std::vector<Write> writes;
++  writes.reserve(4 + RUN_LEVEL_COUNT * 2);
++
++  const bool active = !m_complete;
++  const Pair& current = m_targets[m_level];
++  const auto desired = [&](int index) -> std::uint32_t {
++    if (active)
++    {
++      if (index == m_entrance.arc)
++        return m_level_files[current.arc].name_offset;
++      if (index == m_entrance.bld)
++        return m_level_files[current.bld].name_offset;
++      if (index == current.arc)
++        return m_level_files[m_entrance.arc].name_offset;
++      if (index == current.bld)
++        return m_level_files[m_entrance.bld].name_offset;
++    }
++    return m_level_files[index].name_offset;
++  };
++  const auto add = [&](int index) {
++    writes.push_back({m_level_files[index].entry_address, desired(index)});
++  };
++  add(m_entrance.arc);
++  add(m_entrance.bld);
++  for (const Pair& pair : m_targets)
++  {
++    add(pair.arc);
++    add(pair.bld);
++  }
++
++  const Core::CPUThreadGuard guard(system);
++  for (const Write& w : writes)
++  {
++    const auto current_value = ReadU32(guard, w.address);
++    if (!current_value)
++      continue;
++    // Keep the type byte (0 for files) and only touch the 24-bit name offset.
++    const std::uint32_t value = (*current_value & 0xFF000000) | (w.value & 0x00FFFFFF);
++    if (value != *current_value)
++      PowerPC::MMU::HostTryWrite<u32>(guard, value, w.address);
++  }
++}
++
++void Run::OnDiscRead(std::uint64_t partition_offset, std::uint32_t length, bool in_partition)
++{
++  if (!IsRoguelikeGame())
++    return;
++
++  std::lock_guard lk(m_mutex);
++  // Wii file table offsets are relative to the game partition; ignore raw disc reads.
++  if (!m_fst_valid || (m_is_wii && !in_partition))
++    return;
++
++  const std::uint64_t end = partition_offset + std::max<std::uint32_t>(length, 1);
++  for (const FstFile& file : m_level_files)
++  {
++    if (partition_offset < file.data_end && end > file.data_start)
++    {
++      if (file.stem != m_last_stem)
++      {
++        m_last_stem = file.stem;
++        HandleLoadedStemLocked(file.stem);
++      }
++      return;
++    }
++  }
++}
++
++void Run::HandleLoadedStemLocked(const std::string& stem)
++{
++  if (m_complete)
++    return;
++
++  if (stem == RUN_LEVELS[m_level].file_stem)
++  {
++    if (!m_in_level)
++    {
++      m_in_level = true;
++      m_frames_in_level = 0;
++      INFO_LOG_FMT(CORE, "Roguelike: entered {}", RUN_LEVELS[m_level].display_name);
++    }
++    return;
++  }
++
++  if (StartsWith(stem, "Level_Hub") && m_in_level && m_frames_in_level >= MIN_FRAMES_IN_LEVEL)
++  {
++    m_in_level = false;
++    AdvanceLocked();
++  }
++}
++
++void Run::AdvanceLocked()
++{
++  ++m_level;
++  if (m_level >= RUN_LEVEL_COUNT)
++  {
++    m_level = 0;
++    ++m_loop;
++    if (m_loop >= RUN_LOOP_COUNT)
++    {
++      m_loop = RUN_LOOP_COUNT - 1;
++      m_level = RUN_LEVEL_COUNT - 1;
++      m_complete = true;
++    }
++  }
++  INFO_LOG_FMT(CORE, "Roguelike: next is loop {} level {}", m_loop + 1, m_level + 1);
++}
++
++RunStatus Run::GetStatus() const
++{
++  std::lock_guard lk(m_mutex);
++  RunStatus status;
++  status.show = m_fst_valid || !m_error.empty();
++  status.complete = m_complete;
++  status.in_level = m_in_level;
++  status.loop = m_loop + 1;
++  status.level = m_level + 1;
++  status.level_name = RUN_LEVELS[m_level].display_name;
++  status.error = m_error;
++  return status;
++}
++
++}  // namespace Roguelike
+diff --git a/Source/Core/Core/Roguelike/Run.h b/Source/Core/Core/Roguelike/Run.h
+new file mode 100644
+index 0000000..73bff17
+--- /dev/null
++++ b/Source/Core/Core/Roguelike/Run.h
+@@ -0,0 +1,133 @@
++// Copyright 2026 Dolphin Emulator Project
++// SPDX-License-Identifier: GPL-2.0-or-later
++
++// Roguelike run state for Skylanders: Spyro's Adventure (SSPE52).
++//
++// Level loading: the game opens level archives by name through the disc file table (FST) that the
++// apploader leaves in MEM1. While a run is active, the FST entries of Shattered Island
++// (Level_027_Tutorial) and the run's current level have their name offsets swapped, so picking
++// Shattered Island on Flynn's map loads the current run level instead. Disc reads are matched to
++// FST data ranges (by the original names) to know which level is actually loading, and a return to
++// the hub after a run level advances the run.
++//
++// Threads: OnFrameEnd and OnDiscRead run on the CPU thread; GetStatus may be called from any
++// thread; the state-changed callback runs on the host thread. Everything is guarded by m_mutex.
++
++#pragma once
++
++#include <array>
++#include <cstdint>
++#include <mutex>
++#include <string>
++#include <vector>
++
++#include "Common/HookableEvent.h"
++
++namespace Core
++{
++class System;
++}
++
++namespace Roguelike
++{
++inline constexpr int RUN_LEVEL_COUNT = 9;
++inline constexpr int RUN_LOOP_COUNT = 3;
++
++struct RunLevel
++{
++  const char* display_name;
++  const char* file_stem;
++};
++
++// Chapter order from the design doc. File stems confirmed in-game except Battlefield, Lava Lakes
++// Railway and Lair of Kaos, which match their file names.
++inline constexpr std::array<RunLevel, RUN_LEVEL_COUNT> RUN_LEVELS{{
++    {"Stormy Stronghold", "Level_026_AirCastle"},
++    {"Leviathan Lagoon", "Level_006_IslandEscort"},
++    {"Stonetown", "Level_019_StoneGolem"},
++    {"Falling Forest", "Level_017_LumberJacks"},
++    {"Battlefield", "Level_040_TrollTrenches"},
++    {"Creepy Citadel", "Level_032_Haunted_Castle"},
++    {"Lava Lakes Railway", "Level_024_MineTrain"},
++    {"Arkeyan Armory", "Level_039_UndeadVolcano"},
++    {"Lair of Kaos", "Level_010_FinalLevel"},
++}};
++
++inline constexpr const char* RUN_ENTRANCE_STEM = "Level_027_Tutorial";
++inline constexpr const char* RUN_ENTRANCE_NAME = "Shattered Island";
++inline constexpr const char* RUN_GAME_ID = "SSPE52";
++
++struct RunStatus
++{
++  bool show = false;      // game recognised and file table read
++  bool complete = false;  // all loops finished
++  bool in_level = false;  // currently inside the run level
++  int loop = 1;           // 1-based
++  int level = 1;          // 1-based
++  std::string level_name;
++  std::string error;  // non-empty if the file table could not be used
++};
++
++class Run
++{
++public:
++  static Run& GetInstance();
++
++  Run(const Run&) = delete;
++  Run& operator=(const Run&) = delete;
++
++  void OnFrameEnd(Core::System& system);
++  // partition_offset is relative to the game partition when in_partition is true (Wii).
++  void OnDiscRead(std::uint64_t partition_offset, std::uint32_t length, bool in_partition);
++  RunStatus GetStatus() const;
++
++private:
++  Run();
++
++  struct FstFile
++  {
++    std::uint32_t entry_address = 0;
++    std::uint32_t name_offset = 0;
++    std::uint64_t data_start = 0;
++    std::uint64_t data_end = 0;
++    std::string stem;  // name without extension, from the original (unswapped) table
++  };
++
++  struct Pair
++  {
++    int arc = -1;
++    int bld = -1;
++  };
++
++  void ResetLocked();
++  bool ParseFstLocked(Core::System& system, std::uint32_t fst_address);
++  void ApplySwapLocked(Core::System& system);
++  void HandleLoadedStemLocked(const std::string& stem);
++  void AdvanceLocked();
++
++  mutable std::mutex m_mutex;
++  Common::EventHook m_state_hook;
++
++  // File table cache (original names), valid for the current boot.
++  bool m_fst_valid = false;
++  std::uint32_t m_fst_address = 0;
++  std::uint32_t m_parse_retry_frames = 0;
++  std::string m_error;
++  std::vector<FstFile> m_level_files;  // every file whose name starts with "Level_"
++  Pair m_entrance;
++  std::array<Pair, RUN_LEVEL_COUNT> m_targets{};
++  bool m_is_wii = false;
++
++  // Run progress.
++  bool m_complete = false;
++  int m_loop = 0;   // 0-based
++  int m_level = 0;  // 0-based
++  bool m_in_level = false;
++  std::uint64_t m_frames_in_level = 0;
++  std::string m_last_stem;
++};
++
++// Returns true if the running game is the one the roguelike is built for.
++bool IsRoguelikeGame();
++
++}  // namespace Roguelike
 diff --git a/Source/Core/Core/RoguelikeDev/DevTools.cpp b/Source/Core/Core/RoguelikeDev/DevTools.cpp
 new file mode 100644
 index 0000000..430c2cc
@@ -1914,6 +2453,31 @@ index 8390bbd..52b14f5 100644
    void CloseSkylanderQuickMenu();
  
    struct RepeatState
+diff --git a/Source/Core/DolphinQt/SkylanderPortal/SkylanderPortalWindow.cpp b/Source/Core/DolphinQt/SkylanderPortal/SkylanderPortalWindow.cpp
+index 71a2dba..54eb742 100644
+--- a/Source/Core/DolphinQt/SkylanderPortal/SkylanderPortalWindow.cpp
++++ b/Source/Core/DolphinQt/SkylanderPortal/SkylanderPortalWindow.cpp
+@@ -77,16 +77,10 @@ SkylanderPortalWindow::SkylanderPortalWindow(QWidget* parent) : QWidget(parent)
+   // skylanders folder in user directory
+   QString user_path =
+       QString::fromStdString(File::GetUserPath(D_USER_IDX)) + QStringLiteral("Skylanders");
+-  // first time initialize path in config
+-  if (Config::Get(Config::MAIN_SKYLANDERS_PATH).empty())
+-  {
+-    Config::SetBase(Config::MAIN_SKYLANDERS_PATH, user_path.toStdString());
+-    skylanders_folder = QDir(user_path);
+-  }
+-  else
+-  {
+-    skylanders_folder = QDir(QString::fromStdString(Config::Get(Config::MAIN_SKYLANDERS_PATH)));
+-  }
++  // Roguelike build: always use this install's own User\Skylanders folder, so moving the install
++  // or a path saved by another Dolphin can never point the portal somewhere else.
++  Config::SetBase(Config::MAIN_SKYLANDERS_PATH, user_path.toStdString());
++  skylanders_folder = QDir(user_path);
+   if (!skylanders_folder.exists())
+     skylanders_folder.mkdir(skylanders_folder.path());
+ 
 diff --git a/Source/Core/VideoCommon/CMakeLists.txt b/Source/Core/VideoCommon/CMakeLists.txt
 index 615592b..c0864e9 100644
 --- a/Source/Core/VideoCommon/CMakeLists.txt
@@ -1949,10 +2513,10 @@ index 3e0cf09..0b232a7 100644
  
 diff --git a/Source/Core/VideoCommon/RoguelikeDevOverlay.cpp b/Source/Core/VideoCommon/RoguelikeDevOverlay.cpp
 new file mode 100644
-index 0000000..8fa4a90
+index 0000000..ffa7662
 --- /dev/null
 +++ b/Source/Core/VideoCommon/RoguelikeDevOverlay.cpp
-@@ -0,0 +1,154 @@
+@@ -0,0 +1,219 @@
 +// Copyright 2026 Dolphin Emulator Project
 +// SPDX-License-Identifier: GPL-2.0-or-later
 +
@@ -1964,6 +2528,7 @@ index 0000000..8fa4a90
 +#include <fmt/format.h>
 +#include <imgui.h>
 +
++#include "Core/Roguelike/Run.h"
 +#include "Core/RoguelikeDev/DevTools.h"
 +
 +namespace VideoCommon
@@ -1994,10 +2559,74 @@ index 0000000..8fa4a90
 +  ImGui::TextWrapped("%s", text.c_str());
 +  ImGui::PopStyleColor();
 +}
++
++// Small box in the top-right corner: where the run is and what to do next.
++void DrawRunStatus()
++{
++  const Roguelike::RunStatus run = Roguelike::Run::GetInstance().GetStatus();
++  if (!run.show)
++    return;
++
++  const ImGuiStyle& style = ImGui::GetStyle();
++  const ImVec2 display = ImGui::GetIO().DisplaySize;
++  if (display.x <= 0.0f || display.y <= 0.0f)
++    return;
++  const float global_scale = std::max(style.FontScaleMain * style.FontScaleDpi, 0.01f);
++  const float font_base = std::max(style.FontSizeBase, display.y / 46.0f / global_scale);
++  ImGui::PushFont(nullptr, font_base);
++  const float font = ImGui::GetFontSize();
++  const float pad = font * 0.5f;
++
++  ImGui::SetNextWindowPos(ImVec2(display.x - pad, pad), ImGuiCond_Always, ImVec2(1.0f, 0.0f));
++  ImGui::SetNextWindowBgAlpha(0.75f);
++  ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(pad, pad * 0.6f));
++  ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, font * 0.35f);
++  ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(font * 0.4f, font * 0.15f));
++  ImGui::PushStyleColor(ImGuiCol_WindowBg, COLOR_BG);
++  ImGui::PushStyleColor(ImGuiCol_Border, COLOR_BORDER);
++
++  constexpr ImGuiWindowFlags flags =
++      ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove |
++      ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoNav |
++      ImGuiWindowFlags_NoInputs | ImGuiWindowFlags_NoFocusOnAppearing |
++      ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_AlwaysAutoResize;
++
++  if (ImGui::Begin("Roguelike Run", nullptr, flags))
++  {
++    if (!run.error.empty())
++    {
++      ColoredText(COLOR_ERROR, "Roguelike: level files not found");
++      ColoredText(COLOR_DIM, run.error);
++    }
++    else if (run.complete)
++    {
++      ColoredText(COLOR_OK, "RUN COMPLETE");
++      ColoredText(COLOR_DIM, fmt::format("All {} loops cleared", Roguelike::RUN_LOOP_COUNT));
++    }
++    else
++    {
++      ColoredText(COLOR_TITLE, fmt::format("Loop {}  -  Level {}/{}", run.loop, run.level,
++                                           Roguelike::RUN_LEVEL_COUNT));
++      ColoredText(COLOR_TEXT, run.level_name);
++      if (!run.in_level)
++      {
++        ColoredText(COLOR_DIM,
++                    fmt::format("Pick {} on Flynn's map", Roguelike::RUN_ENTRANCE_NAME));
++      }
++    }
++  }
++  ImGui::End();
++
++  ImGui::PopStyleColor(2);
++  ImGui::PopStyleVar(3);
++  ImGui::PopFont();
++}
 +}  // namespace
 +
 +void DrawRoguelikeDevOverlay()
 +{
++  DrawRunStatus();
++
 +  const RoguelikeDev::OverlayState state = RoguelikeDev::DevTools::GetInstance().GetOverlayState();
 +  if (!state.visible)
 +    return;

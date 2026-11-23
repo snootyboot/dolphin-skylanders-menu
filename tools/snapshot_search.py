@@ -50,6 +50,9 @@ TYPES = {
     "s16": (">i2", 2),
     "s32": (">i4", 4),
     "f32": (">f4", 4),
+    # Little-endian: raw Skylander figure data (gold, XP) is little-endian even on the Wii.
+    "u16le": ("<u2", 2),
+    "u32le": ("<u4", 4),
 }
 
 
