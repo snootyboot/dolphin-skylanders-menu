@@ -1,0 +1,2125 @@
+diff --git a/Source/Core/Core/CMakeLists.txt b/Source/Core/Core/CMakeLists.txt
+index 56c8dba..6730d28 100644
+--- a/Source/Core/Core/CMakeLists.txt
++++ b/Source/Core/Core/CMakeLists.txt
+@@ -139,6 +139,10 @@ add_library(core
+   Host.h
+   HotkeyManager.cpp
+   HotkeyManager.h
++  RoguelikeDev/DevTools.cpp
++  RoguelikeDev/DevTools.h
++  RoguelikeDev/DevToolsParse.cpp
++  RoguelikeDev/DevToolsParse.h
+   HW/AddressSpace.cpp
+   HW/AddressSpace.h
+   HW/AudioInterface.cpp
+@@ -702,6 +706,7 @@ PRIVATE
+   LZO::LZO
+   LZ4::LZ4
+   ZLIB::ZLIB
++  zstd::zstd
+ )
+ 
+ if(LIBUDEV_FOUND)
+diff --git a/Source/Core/Core/Config/MainSettings.cpp b/Source/Core/Core/Config/MainSettings.cpp
+index f0cc851..893bce4 100644
+--- a/Source/Core/Core/Config/MainSettings.cpp
++++ b/Source/Core/Core/Config/MainSettings.cpp
+@@ -626,7 +626,7 @@ void SetUSBDeviceWhitelist(const std::set<USBUtils::DeviceInfo>& devices)
+ // Main.EmulatedUSBDevices
+ 
+ const Info<bool> MAIN_EMULATE_SKYLANDER_PORTAL{
+-    {System::Main, "EmulatedUSBDevices", "EmulateSkylanderPortal"}, false};
++    {System::Main, "EmulatedUSBDevices", "EmulateSkylanderPortal"}, true};
+ 
+ const Info<bool> MAIN_EMULATE_INFINITY_BASE{
+     {System::Main, "EmulatedUSBDevices", "EmulateInfinityBase"}, false};
+diff --git a/Source/Core/Core/Core.cpp b/Source/Core/Core/Core.cpp
+index e205ac0..3128223 100644
+--- a/Source/Core/Core/Core.cpp
++++ b/Source/Core/Core/Core.cpp
+@@ -69,6 +69,7 @@
+ #include "Core/PowerPC/GDBStub.h"
+ #include "Core/PowerPC/JitInterface.h"
+ #include "Core/PowerPC/PowerPC.h"
++#include "Core/RoguelikeDev/DevTools.h"
+ #include "Core/State.h"
+ #include "Core/System.h"
+ #include "Core/WiiRoot.h"
+@@ -150,6 +151,8 @@ void FrameUpdateOnCPUThread()
+ 
+ void OnFrameEnd(Core::System& system)
+ {
++  RoguelikeDev::DevTools::GetInstance().OnFrameEnd(system);
++
+ #ifdef USE_MEMORYWATCHER
+   if (s_memory_watcher)
+   {
+diff --git a/Source/Core/Core/HotkeyManager.cpp b/Source/Core/Core/HotkeyManager.cpp
+index 89e9130..69c4356 100644
+--- a/Source/Core/Core/HotkeyManager.cpp
++++ b/Source/Core/Core/HotkeyManager.cpp
+@@ -209,6 +209,13 @@ constexpr std::array<const char*, NUM_HOTKEYS> s_hotkey_labels{{
+     _trans("Quick Menu Previous Slot"),
+     _trans("Quick Menu Next Slot"),
+     _trans("Quick Menu Remove"),
++
++    _trans("Dev: Capture Step"),
++    _trans("Dev: Skip Step"),
++    _trans("Dev: Undo"),
++    _trans("Dev: Show/Hide Panel"),
++    _trans("Dev: Record Watch List"),
++    _trans("Dev: Reload Files"),
+ }};
+ // clang-format on
+ static_assert(NUM_HOTKEYS == s_hotkey_labels.size(), "Wrong count of hotkey_labels");
+@@ -336,7 +343,8 @@ constexpr std::array<HotkeyGroupInfo, NUM_HOTKEY_GROUPS> s_groups_info = {
+      {_trans("GBA Core"), HK_GBA_LOAD, HK_GBA_RESET, true},
+      {_trans("GBA Volume"), HK_GBA_VOLUME_DOWN, HK_GBA_TOGGLE_MUTE, true},
+      {_trans("GBA Window Size"), HK_GBA_1X, HK_GBA_4X, true},
+-     {_trans("USB Emulation Devices"), HK_SKYLANDERS_PORTAL, HK_SKYLANDERS_MENU_REMOVE}}};
++     {_trans("USB Emulation Devices"), HK_SKYLANDERS_PORTAL, HK_SKYLANDERS_MENU_REMOVE},
++     {_trans("Roguelike Dev Tools"), HK_ROGUELIKE_DEV_CAPTURE, HK_ROGUELIKE_DEV_RELOAD}}};
+ 
+ HotkeyManager::HotkeyManager()
+ {
+@@ -505,4 +513,21 @@ void HotkeyManager::LoadDefaults(const ControllerInterface& ciface)
+   set_key_expression(HK_SKYLANDERS_MENU_PREV_SLOT, pad_input("Shoulder L"));
+   set_key_expression(HK_SKYLANDERS_MENU_NEXT_SLOT, pad_input("Shoulder R"));
+   set_key_expression(HK_SKYLANDERS_MENU_REMOVE, pad_input("Button N"));
++
++  // Roguelike dev tools: navigation-cluster keys, which nothing else uses by default.
++#ifdef _WIN32
++  set_key_expression(HK_ROGUELIKE_DEV_CAPTURE, "`END` | `NUMPAD0`");
++  set_key_expression(HK_ROGUELIKE_DEV_SKIP, "`NEXT`");
++  set_key_expression(HK_ROGUELIKE_DEV_UNDO, "`DELETE`");
++  set_key_expression(HK_ROGUELIKE_DEV_TOGGLE_PANEL, "`HOME`");
++  set_key_expression(HK_ROGUELIKE_DEV_TOGGLE_RECORDING, "`INSERT`");
++  set_key_expression(HK_ROGUELIKE_DEV_RELOAD, "`PRIOR`");
++#else
++  set_key_expression(HK_ROGUELIKE_DEV_CAPTURE, "`End` | `KP_0` | `KP_Insert`");
++  set_key_expression(HK_ROGUELIKE_DEV_SKIP, "`Next`");
++  set_key_expression(HK_ROGUELIKE_DEV_UNDO, "`Delete`");
++  set_key_expression(HK_ROGUELIKE_DEV_TOGGLE_PANEL, "`Home`");
++  set_key_expression(HK_ROGUELIKE_DEV_TOGGLE_RECORDING, "`Insert`");
++  set_key_expression(HK_ROGUELIKE_DEV_RELOAD, "`Prior`");
++#endif
+ }
+diff --git a/Source/Core/Core/HotkeyManager.h b/Source/Core/Core/HotkeyManager.h
+index d8e1878..629574d 100644
+--- a/Source/Core/Core/HotkeyManager.h
++++ b/Source/Core/Core/HotkeyManager.h
+@@ -197,6 +197,13 @@ enum Hotkey
+   HK_SKYLANDERS_MENU_NEXT_SLOT,
+   HK_SKYLANDERS_MENU_REMOVE,
+ 
++  HK_ROGUELIKE_DEV_CAPTURE,
++  HK_ROGUELIKE_DEV_SKIP,
++  HK_ROGUELIKE_DEV_UNDO,
++  HK_ROGUELIKE_DEV_TOGGLE_PANEL,
++  HK_ROGUELIKE_DEV_TOGGLE_RECORDING,
++  HK_ROGUELIKE_DEV_RELOAD,
++
+   NUM_HOTKEYS,
+ };
+ 
+@@ -229,6 +236,7 @@ enum HotkeyGroup : int
+   HKGP_GBA_VOLUME,
+   HKGP_GBA_SIZE,
+   HKGP_USB_EMU,
++  HKGP_ROGUELIKE_DEV,
+ 
+   NUM_HOTKEY_GROUPS,
+ };
+diff --git a/Source/Core/Core/RoguelikeDev/DevTools.cpp b/Source/Core/Core/RoguelikeDev/DevTools.cpp
+new file mode 100644
+index 0000000..430c2cc
+--- /dev/null
++++ b/Source/Core/Core/RoguelikeDev/DevTools.cpp
+@@ -0,0 +1,892 @@
++// Copyright 2026 Dolphin Emulator Project
++// SPDX-License-Identifier: GPL-2.0-or-later
++
++#include "Core/RoguelikeDev/DevTools.h"
++
++#include <algorithm>
++#include <array>
++#include <cstring>
++#include <ctime>
++#include <new>
++#include <utility>
++
++#include <fmt/chrono.h>
++#include <fmt/format.h>
++#include <fmt/ranges.h>
++#include <zstd.h>
++
++#include "Common/CommonPaths.h"
++#include "Common/FileUtil.h"
++#include "Common/Logging/Log.h"
++#include "Common/TimeUtil.h"
++#include "Core/ConfigManager.h"
++#include "Core/Core.h"
++#include "Core/HW/Memmap.h"
++#include "Core/PowerPC/MMU.h"
++#include "Core/System.h"
++#include "VideoCommon/OnScreenDisplay.h"
++
++namespace RoguelikeDev
++{
++namespace
++{
++constexpr int MAX_CAPTURES_IN_FLIGHT = 2;
++constexpr int WATCH_SAMPLE_INTERVAL = 4;  // frames
++constexpr int CSV_FLUSH_INTERVAL = 30;    // rows
++constexpr auto CAPTURE_REQUEST_TIMEOUT = std::chrono::seconds(3);
++constexpr int ZSTD_LEVEL = 1;
++
++
++constexpr std::uint32_t MEM1_BASE = 0x80000000;
++constexpr std::uint32_t MEM1_UNCACHED_BASE = 0xC0000000;
++constexpr std::uint32_t MEM2_BASE = 0x90000000;
++constexpr std::uint32_t MEM2_UNCACHED_BASE = 0xD0000000;
++
++constexpr std::string_view README_TEXT =
++    "Skylanders roguelike dev tools\n"
++    "==============================\n"
++    "\n"
++    "Keys (rebind under Options > Hotkey Settings > USB Emulation):\n"
++    "  End (or Numpad 0)  capture the current step\n"
++    "  Page Down          skip the current step\n"
++    "  Delete             undo the last capture or skip\n"
++    "  Home               show or hide the dev tools panel\n"
++    "  Insert             start or stop recording the watch list to CSV\n"
++    "  Page Up            reload session.txt and watch.txt\n"
++    "\n"
++    "session.txt - one step per line: label | instruction\n"
++    "  title: Gold and health\n"
++    "  full_hp | Stand still at full health, then press End.\n"
++    "\n"
++    "watch.txt - one value per line: name | type | address [> offset ...]\n"
++    "  types: u8 u16 u32 s8 s16 s32 f32 f64 hex\n"
++    "  Gold | u32 | 0x80A1B2C0\n"
++    "  Health | f32 | 0x80701234 > 0x10 > 0x1A4\n"
++    "  Each '> offset' reads a pointer at the current address and adds the offset.\n"
++    "\n"
++    "Captures/ holds one folder per session: compressed memory snapshots plus manifest.json.\n"
++    "WatchLogs/ holds watch recordings as CSV.\n";
++
++std::string LocalTimeString(std::string_view format)
++{
++  const auto tm = Common::LocalTime(std::time(nullptr));
++  if (!tm)
++    return "unknown";
++  return fmt::format(fmt::runtime(fmt::format("{{:{}}}", format)), *tm);
++}
++
++const char* StatusName(int status)
++{
++  static constexpr std::array<const char*, 5> names = {"saving", "saved", "failed", "skipped",
++                                                       "discarded"};
++  return (status >= 0 && status < static_cast<int>(names.size())) ? names[status] : "unknown";
++}
++
++// Emulated main memory only: never touch MMIO or unmapped space from a watch.
++bool IsRamRange(std::uint32_t address, std::size_t size, std::uint32_t mem1_size,
++                std::uint32_t mem2_size)
++{
++  const auto in = [&](std::uint32_t base, std::uint32_t length) {
++    return length != 0 && address >= base && address - base < length &&
++           size <= length - (address - base);
++  };
++  return in(MEM1_BASE, mem1_size) || in(MEM1_UNCACHED_BASE, mem1_size) ||
++         in(MEM2_BASE, mem2_size) || in(MEM2_UNCACHED_BASE, mem2_size);
++}
++
++}  // namespace
++
++DevTools& DevTools::GetInstance()
++{
++  static DevTools instance;
++  return instance;
++}
++
++DevTools::DevTools() : m_worker([this] { WorkerLoop(); })
++{
++}
++
++DevTools::~DevTools()
++{
++  {
++    std::lock_guard lk(m_mutex);
++    m_stop = true;
++    StopRecordingLocked();
++  }
++  m_jobs_cv.notify_all();
++  if (m_worker.joinable())
++    m_worker.join();
++}
++
++std::string DevTools::GetFolder()
++{
++  return File::GetUserPath(D_USER_IDX) + "Roguelike" DIR_SEP "DevTools" DIR_SEP;
++}
++
++// ---------------------------------------------------------------------------------------------
++// Loading
++
++void DevTools::EnsureLoadedLocked()
++{
++  if (m_loaded)
++    return;
++  m_loaded = true;
++  LoadFilesLocked();
++  m_visible = !m_session->steps.empty() || !m_watches.empty();
++}
++
++void DevTools::LoadFilesLocked()
++{
++  const std::string folder = GetFolder();
++  File::CreateFullPath(folder);
++  const std::string readme = folder + "README.txt";
++  if (!File::Exists(readme))
++    File::WriteStringToFile(readme, README_TEXT);
++
++  m_file_errors.clear();
++
++  std::string text;
++  m_session.reset();
++  if (File::ReadFileToString(folder + "session.txt", text))
++  {
++    SessionScript script = ParseSessionScript(text);
++    for (const ParseError& error : script.errors)
++      m_file_errors.push_back(fmt::format("session.txt line {}: {}", error.line, error.message));
++    if (!script.steps.empty())
++    {
++      m_session = std::make_shared<Session>();
++      m_session->title = script.title.empty() ? "Untitled session" : script.title;
++      m_session->steps = std::move(script.steps);
++    }
++    else
++    {
++      m_file_errors.push_back("session.txt has no steps.");
++    }
++  }
++  StartSessionLocked();
++
++  text.clear();
++  m_watches.clear();
++  if (File::ReadFileToString(folder + "watch.txt", text))
++  {
++    WatchList list = ParseWatchList(text);
++    for (const ParseError& error : list.errors)
++      m_file_errors.push_back(fmt::format("watch.txt line {}: {}", error.line, error.message));
++    m_watches = std::move(list.entries);
++  }
++  m_watch_values.assign(m_watches.size(), "-");
++  m_watch_csv_values.assign(m_watches.size(), "");
++
++  if (!m_file_errors.empty())
++  {
++    WARN_LOG_FMT(CORE, "Roguelike dev tools:\n{}", fmt::join(m_file_errors, "\n"));
++  }
++}
++
++// A fresh session object: the next capture starts a new folder. Captures still being written
++// keep a reference to their old session, so nothing in flight is lost.
++void DevTools::StartSessionLocked()
++{
++  if (!m_session)
++    m_session = std::make_shared<Session>();
++  else
++    m_session = std::make_shared<Session>(Session{m_session->title, m_session->steps, {}, {}, {}});
++  m_step = 0;
++  m_history.clear();
++  m_capture_requested = false;
++}
++
++bool DevTools::EnsureSessionDirLocked()
++{
++  if (!m_session->dir.empty())
++    return true;
++
++  const std::string stamp = LocalTimeString("%Y%m%d-%H%M%S");
++  std::string name = stamp;
++  const std::string title_label = SanitizeLabel(m_session->title);
++  if (!title_label.empty())
++    name += "_" + title_label;
++
++  const std::string base = GetFolder() + "Captures" DIR_SEP;
++  std::string dir = base + name + DIR_SEP;
++  for (int i = 2; File::Exists(dir) && i < 100; ++i)
++    dir = base + fmt::format("{}_{}", name, i) + DIR_SEP;
++
++  if (!File::CreateFullPath(dir))
++  {
++    SetStatusLocked("Couldn't create the capture folder.", StatusKind::Error);
++    return false;
++  }
++  m_session->dir = dir;
++  m_session->started = LocalTimeString("%Y-%m-%dT%H:%M:%S");
++  return true;
++}
++
++// ---------------------------------------------------------------------------------------------
++// Hotkey thread
++
++void DevTools::RequestCapture()
++{
++  std::lock_guard lk(m_mutex);
++  EnsureLoadedLocked();
++
++  if (m_captures_in_flight >= MAX_CAPTURES_IN_FLIGHT)
++  {
++    SetStatusLocked("Still saving the last capture - press again in a moment.", StatusKind::Error);
++    return;
++  }
++  if (m_capture_requested)
++    return;
++
++  m_capture_requested = true;
++  m_capture_request_step = m_step;
++  m_capture_request_time = std::chrono::steady_clock::now();
++}
++
++void DevTools::Undo()
++{
++  std::lock_guard lk(m_mutex);
++  EnsureLoadedLocked();
++
++  if (m_capture_requested)
++  {
++    m_capture_requested = false;
++    SetStatusLocked("Capture cancelled.", StatusKind::Info);
++    return;
++  }
++  if (m_history.empty())
++  {
++    SetStatusLocked("Nothing to undo.", StatusKind::Info);
++    return;
++  }
++
++  const Action action = m_history.back();
++  m_history.pop_back();
++
++  Entry& entry = m_session->entries[action.entry];
++  const EntryStatus previous = entry.status;
++  entry.status = EntryStatus::Discarded;
++  if (action.is_capture && previous == EntryStatus::Saved && !entry.file.empty())
++  {
++    Job job;
++    job.kind = Job::Kind::Delete;
++    job.session = m_session;
++    job.path = m_session->dir + entry.file;
++    QueueJobLocked(std::move(job));
++  }
++  // A capture that's still saving is deleted by the worker once it sees it was discarded.
++
++  if (action.step >= 0)
++    m_step = static_cast<std::size_t>(action.step);
++
++  SetStatusLocked(fmt::format("Undid {} '{}'.", action.is_capture ? "capture" : "skip",
++                              entry.label),
++                  StatusKind::Info);
++  QueueManifestLocked();
++}
++
++void DevTools::Skip()
++{
++  std::lock_guard lk(m_mutex);
++  EnsureLoadedLocked();
++
++  if (m_session->steps.empty() || m_step >= m_session->steps.size())
++  {
++    SetStatusLocked("No step to skip.", StatusKind::Info);
++    return;
++  }
++  if (!EnsureSessionDirLocked())
++    return;
++
++  m_capture_requested = false;
++  const SessionStep& step = m_session->steps[m_step];
++  Entry entry;
++  entry.index = static_cast<int>(m_session->entries.size()) + 1;
++  entry.step = static_cast<int>(m_step);
++  entry.label = step.label;
++  entry.instruction = step.instruction;
++  entry.status = EntryStatus::Skipped;
++  entry.time = LocalTimeString("%Y-%m-%dT%H:%M:%S");
++  m_session->entries.push_back(std::move(entry));
++  m_history.push_back({false, static_cast<int>(m_step), m_session->entries.size() - 1});
++  ++m_step;
++
++  SetStatusLocked(fmt::format("Skipped '{}'.", step.label), StatusKind::Info);
++  QueueManifestLocked();
++}
++
++void DevTools::ToggleOverlay()
++{
++  std::lock_guard lk(m_mutex);
++  EnsureLoadedLocked();
++  m_visible = !m_visible;
++}
++
++void DevTools::ToggleRecording()
++{
++  std::lock_guard lk(m_mutex);
++  EnsureLoadedLocked();
++  if (!m_recording_wanted && m_watches.empty())
++  {
++    SetStatusLocked("watch.txt is empty - nothing to record.", StatusKind::Error);
++    return;
++  }
++  m_recording_wanted = !m_recording_wanted;
++}
++
++void DevTools::ReloadFiles()
++{
++  std::lock_guard lk(m_mutex);
++  m_loaded = true;
++  StopRecordingLocked();
++  m_recording_wanted = false;
++  LoadFilesLocked();
++  m_visible = true;
++  if (m_file_errors.empty())
++    SetStatusLocked("Reloaded session.txt and watch.txt.", StatusKind::Ok);
++  else
++    SetStatusLocked("Reloaded with errors (see below).", StatusKind::Error);
++}
++
++// ---------------------------------------------------------------------------------------------
++// CPU thread
++
++void DevTools::OnFrameEnd(Core::System& system)
++{
++  bool capture = false;
++  bool sample = false;
++  {
++    std::lock_guard lk(m_mutex);
++    EnsureLoadedLocked();
++    ++m_frame;
++
++    if (m_capture_requested)
++    {
++      if (std::chrono::steady_clock::now() - m_capture_request_time > CAPTURE_REQUEST_TIMEOUT)
++      {
++        m_capture_requested = false;
++        SetStatusLocked("Capture timed out - press again.", StatusKind::Error);
++      }
++      else
++      {
++        capture = true;
++      }
++    }
++
++    if (m_recording_wanted && !m_recording)
++      StartRecordingLocked();
++    else if (!m_recording_wanted && m_recording)
++    {
++      StopRecordingLocked();
++      SetStatusLocked("Watch recording saved to WatchLogs.", StatusKind::Ok);
++    }
++
++    sample = !m_watches.empty() && (m_visible || m_recording) &&
++             m_frame % WATCH_SAMPLE_INTERVAL == 0;
++  }
++
++  if (capture)
++    TakeCapture(system);
++  if (sample)
++    SampleWatches(system);
++}
++
++void DevTools::TakeCapture(Core::System& system)
++{
++  auto& memory = system.GetMemory();
++  const bool is_wii = system.IsWii();
++  const u8* mem1 = memory.GetRAM();
++  const std::uint32_t mem1_size = mem1 ? memory.GetRamSizeReal() : 0;
++  const u8* mem2 = is_wii ? memory.GetEXRAM() : nullptr;
++  const std::uint32_t mem2_size = mem2 ? memory.GetExRamSizeReal() : 0;
++
++  std::shared_ptr<Session> session;
++  std::size_t entry_index = 0;
++  std::string game_id = SConfig::GetInstance().GetGameID();
++  std::uint64_t frame = 0;
++  {
++    std::lock_guard lk(m_mutex);
++    if (!m_capture_requested)
++      return;  // cancelled meanwhile
++    m_capture_requested = false;
++
++    if (mem1_size == 0)
++    {
++      SetStatusLocked("No game memory to capture.", StatusKind::Error);
++      return;
++    }
++    if (m_captures_in_flight >= MAX_CAPTURES_IN_FLIGHT)
++    {
++      SetStatusLocked("Still saving the last capture - press again in a moment.",
++                      StatusKind::Error);
++      return;
++    }
++    if (!EnsureSessionDirLocked())
++      return;
++
++    // The request was made for this step; undo/skip since then cancel it, so they still match.
++    const std::size_t step_index = m_capture_request_step;
++    const bool in_script = step_index < m_session->steps.size();
++
++    Entry entry;
++    entry.index = static_cast<int>(m_session->entries.size()) + 1;
++    entry.step = in_script ? static_cast<int>(step_index) : -1;
++    if (in_script)
++    {
++      entry.label = m_session->steps[step_index].label;
++      entry.instruction = m_session->steps[step_index].instruction;
++    }
++    else
++    {
++      entry.label = "extra";
++      entry.instruction = "Capture after the end of the session.";
++    }
++    entry.file = fmt::format("{:03}_{}.snap.zst", entry.index, entry.label);
++    entry.status = EntryStatus::Saving;
++    entry.game_id = game_id;
++    entry.frame = m_frame;
++    entry.time = LocalTimeString("%Y-%m-%dT%H:%M:%S");
++    entry.mem1_size = mem1_size;
++    entry.mem2_size = mem2_size;
++    frame = m_frame;
++
++    m_session->entries.push_back(std::move(entry));
++    entry_index = m_session->entries.size() - 1;
++    m_history.push_back({true, in_script ? static_cast<int>(step_index) : -1, entry_index});
++    if (in_script)
++      m_step = step_index + 1;
++    ++m_captures_in_flight;
++    session = m_session;
++  }
++
++  // Copy memory outside the lock. Only this (CPU) thread writes emulated memory, so the snapshot
++  // is consistent.
++  Job job;
++  job.kind = Job::Kind::Capture;
++  job.session = session;
++  job.entry = entry_index;
++  job.size = SNAPSHOT_HEADER_SIZE + std::size_t{mem1_size} + mem2_size;
++  // Exceptions are disabled in Dolphin builds, so allocate without throwing.
++  job.data.reset(new (std::nothrow) std::uint8_t[job.size]);
++  const bool ok = job.data != nullptr;
++
++  if (ok)
++  {
++    std::uint8_t* out = job.data.get();
++    const auto header = MakeSnapshotHeader(mem1_size, mem2_size, frame, game_id);
++    std::memcpy(out, header.data(), header.size());
++    std::memcpy(out + SNAPSHOT_HEADER_SIZE, mem1, mem1_size);
++    if (mem2_size != 0)
++      std::memcpy(out + SNAPSHOT_HEADER_SIZE + mem1_size, mem2, mem2_size);
++  }
++
++  std::lock_guard lk(m_mutex);
++  Entry& entry = session->entries[entry_index];
++  if (!ok)
++  {
++    --m_captures_in_flight;
++    if (entry.status != EntryStatus::Discarded)
++    {
++      entry.status = EntryStatus::Failed;
++      entry.error = "Out of memory while copying.";
++    }
++    SetStatusLocked("Capture failed: out of memory.", StatusKind::Error);
++    QueueManifestLocked();
++    return;
++  }
++  SetStatusLocked(fmt::format("Captured '{}' - saving...", entry.label), StatusKind::Info);
++  QueueJobLocked(std::move(job));
++}
++
++void DevTools::SampleWatches(Core::System& system)
++{
++  std::vector<WatchEntry> watches;
++  {
++    std::lock_guard lk(m_mutex);
++    watches = m_watches;
++  }
++
++  auto& memory = system.GetMemory();
++  const std::uint32_t mem1_size = memory.GetRAM() ? memory.GetRamSizeReal() : 0;
++  const std::uint32_t mem2_size =
++      (system.IsWii() && memory.GetEXRAM()) ? memory.GetExRamSizeReal() : 0;
++
++  std::vector<std::string> display(watches.size());
++  std::vector<std::string> csv(watches.size());
++  {
++    const Core::CPUThreadGuard guard(system);
++    for (std::size_t i = 0; i < watches.size(); ++i)
++    {
++      const WatchEntry& watch = watches[i];
++      std::uint32_t address = watch.base;
++      bool valid = true;
++      for (const std::int64_t offset : watch.offsets)
++      {
++        if (!IsRamRange(address, 4, mem1_size, mem2_size))
++        {
++          valid = false;
++          break;
++        }
++        const auto pointer = PowerPC::MMU::HostTryRead<u32>(guard, address);
++        if (!pointer)
++        {
++          valid = false;
++          break;
++        }
++        address = static_cast<std::uint32_t>(static_cast<std::int64_t>(pointer->value) + offset);
++      }
++
++      const std::size_t size = WatchTypeSize(watch.type);
++      if (!valid || !IsRamRange(address, size, mem1_size, mem2_size))
++      {
++        display[i] = "??";
++        continue;
++      }
++
++      std::optional<std::uint64_t> raw;
++      switch (size)
++      {
++      case 1:
++        if (const auto r = PowerPC::MMU::HostTryRead<u8>(guard, address))
++          raw = r->value;
++        break;
++      case 2:
++        if (const auto r = PowerPC::MMU::HostTryRead<u16>(guard, address))
++          raw = r->value;
++        break;
++      case 8:
++        if (const auto r = PowerPC::MMU::HostTryRead<u64>(guard, address))
++          raw = r->value;
++        break;
++      default:
++        if (const auto r = PowerPC::MMU::HostTryRead<u32>(guard, address))
++          raw = r->value;
++        break;
++      }
++      if (!raw)
++      {
++        display[i] = "??";
++        continue;
++      }
++      csv[i] = FormatWatchValue(watch.type, *raw);
++      display[i] = watch.offsets.empty() ? csv[i] : fmt::format("{}  @{:08X}", csv[i], address);
++    }
++  }
++
++  std::lock_guard lk(m_mutex);
++  // The list may have been reloaded while sampling; only publish matching results.
++  if (m_watches.size() != watches.size())
++    return;
++  m_watch_values = std::move(display);
++  m_watch_csv_values = csv;
++
++  if (m_recording && m_csv.IsOpen())
++  {
++    const double seconds =
++        std::chrono::duration<double>(std::chrono::steady_clock::now() - m_recording_start)
++            .count();
++    std::string row = fmt::format("{},{:.3f}", m_frame, seconds);
++    for (const std::string& value : csv)
++      row += "," + CsvEscape(value);
++    row += "\n";
++    if (!m_csv.WriteString(row))
++    {
++      SetStatusLocked("Couldn't write the watch recording.", StatusKind::Error);
++      StopRecordingLocked();
++      m_recording_wanted = false;
++      return;
++    }
++    if (++m_csv_rows_since_flush >= CSV_FLUSH_INTERVAL)
++    {
++      m_csv.Flush();
++      m_csv_rows_since_flush = 0;
++    }
++  }
++}
++
++void DevTools::StartRecordingLocked()
++{
++  const std::string dir = GetFolder() + "WatchLogs" DIR_SEP;
++  File::CreateFullPath(dir);
++  const std::string path = dir + "watch_" + LocalTimeString("%Y%m%d-%H%M%S") + ".csv";
++  if (!m_csv.Open(path, "wb"))
++  {
++    SetStatusLocked("Couldn't create the watch recording file.", StatusKind::Error);
++    m_recording_wanted = false;
++    return;
++  }
++
++  std::string header = "frame,seconds";
++  for (const WatchEntry& watch : m_watches)
++    header += "," + CsvEscape(watch.name);
++  header += "\n";
++  m_csv.WriteString(header);
++
++  m_recording = true;
++  m_csv_rows_since_flush = 0;
++  m_recording_start = std::chrono::steady_clock::now();
++  SetStatusLocked("Recording watch values.", StatusKind::Ok);
++}
++
++void DevTools::StopRecordingLocked()
++{
++  if (!m_recording)
++    return;
++  m_recording = false;
++  m_csv.Flush();
++  m_csv.Close();
++}
++
++// ---------------------------------------------------------------------------------------------
++// Shared helpers
++
++void DevTools::SetStatusLocked(std::string text, StatusKind kind)
++{
++  m_status = text;
++  m_status_kind = kind;
++  // While shutting down, the on-screen display and logging may already be gone.
++  if (m_stop)
++    return;
++  if (kind == StatusKind::Error)
++    WARN_LOG_FMT(CORE, "Roguelike dev tools: {}", text);
++  OSD::AddMessage("Dev tools: " + text, OSD::Duration::NORMAL,
++                  kind == StatusKind::Error ? OSD::Color::RED :
++                  kind == StatusKind::Ok    ? OSD::Color::GREEN :
++                                              OSD::Color::CYAN);
++}
++
++void DevTools::QueueJobLocked(Job job)
++{
++  m_jobs.push_back(std::move(job));
++  m_jobs_cv.notify_one();
++}
++
++void DevTools::QueueManifestLocked()
++{
++  for (const Job& job : m_jobs)
++  {
++    if (job.kind == Job::Kind::Manifest && job.session == m_session)
++      return;
++  }
++  Job job;
++  job.kind = Job::Kind::Manifest;
++  job.session = m_session;
++  QueueJobLocked(std::move(job));
++}
++
++int DevTools::CountEntriesLocked(EntryStatus status) const
++{
++  if (!m_session)
++    return 0;
++  return static_cast<int>(std::count_if(m_session->entries.begin(), m_session->entries.end(),
++                                        [status](const Entry& e) { return e.status == status; }));
++}
++
++// ---------------------------------------------------------------------------------------------
++// Worker thread
++
++void DevTools::WorkerLoop()
++{
++  while (true)
++  {
++    Job job;
++    {
++      std::unique_lock lk(m_mutex);
++      m_jobs_cv.wait(lk, [this] { return m_stop || !m_jobs.empty(); });
++      if (m_jobs.empty())
++        return;  // stop requested and nothing left to write
++      job = std::move(m_jobs.front());
++      m_jobs.pop_front();
++    }
++    RunJob(job);
++  }
++}
++
++void DevTools::RunJob(Job& job)
++{
++  switch (job.kind)
++  {
++  case Job::Kind::Delete:
++    File::Delete(job.path, File::IfAbsentBehavior::NoConsoleWarning);
++    WriteManifest(job.session);
++    return;
++
++  case Job::Kind::Manifest:
++    WriteManifest(job.session);
++    return;
++
++  case Job::Kind::Capture:
++    break;
++  }
++
++  std::string path;
++  {
++    std::lock_guard lk(m_mutex);
++    path = job.session->dir + job.session->entries[job.entry].file;
++  }
++
++  std::string error;
++  std::uint64_t written = 0;
++  const std::size_t bound = ZSTD_compressBound(job.size);
++  std::unique_ptr<std::uint8_t[]> compressed(new (std::nothrow) std::uint8_t[bound]);
++  if (!compressed)
++    error = "Out of memory while compressing.";
++
++  if (error.empty())
++  {
++    const std::size_t size =
++        ZSTD_compress(compressed.get(), bound, job.data.get(), job.size, ZSTD_LEVEL);
++    if (ZSTD_isError(size))
++    {
++      error = fmt::format("Compression failed: {}", ZSTD_getErrorName(size));
++    }
++    else
++    {
++      job.data.reset();
++      const std::string temp = path + ".tmp";
++      File::IOFile file(temp, "wb");
++      const bool wrote = file.IsOpen() && file.WriteBytes(compressed.get(), size) && file.Flush();
++      file.Close();
++      if (!wrote)
++      {
++        File::Delete(temp, File::IfAbsentBehavior::NoConsoleWarning);
++        error = "Couldn't write the file (disk full?).";
++      }
++      else if (!File::Rename(temp, path))
++      {
++        File::Delete(temp, File::IfAbsentBehavior::NoConsoleWarning);
++        error = "Couldn't rename the file.";
++      }
++      else
++      {
++        written = size;
++      }
++    }
++  }
++
++  bool delete_file = false;
++  {
++    std::lock_guard lk(m_mutex);
++    --m_captures_in_flight;
++    Entry& entry = job.session->entries[job.entry];
++    if (entry.status == EntryStatus::Discarded)
++    {
++      delete_file = error.empty();
++    }
++    else if (!error.empty())
++    {
++      entry.status = EntryStatus::Failed;
++      entry.error = error;
++      SetStatusLocked(fmt::format("Capture '{}' failed: {}", entry.label, error),
++                      StatusKind::Error);
++    }
++    else
++    {
++      entry.status = EntryStatus::Saved;
++      entry.bytes = written;
++      SetStatusLocked(fmt::format("Saved '{}' ({:.1f} MB).", entry.label,
++                                  static_cast<double>(written) / (1024.0 * 1024.0)),
++                      StatusKind::Ok);
++    }
++  }
++
++  if (delete_file)
++    File::Delete(path, File::IfAbsentBehavior::NoConsoleWarning);
++  WriteManifest(job.session);
++}
++
++void DevTools::WriteManifest(const std::shared_ptr<Session>& session)
++{
++  std::string json;
++  std::string path;
++  {
++    std::lock_guard lk(m_mutex);
++    if (!session || session->dir.empty())
++      return;
++    path = session->dir + "manifest.json";
++
++    json = "{\n";
++    json += "  \"tool\": \"Skylanders roguelike dev tools\",\n";
++    json += fmt::format("  \"format\": {},\n", SNAPSHOT_VERSION);
++    json += fmt::format("  \"title\": \"{}\",\n", JsonEscape(session->title));
++    json += fmt::format("  \"started\": \"{}\",\n", JsonEscape(session->started));
++    json += fmt::format("  \"snapshot_header_size\": {},\n", SNAPSHOT_HEADER_SIZE);
++    json += "  \"steps\": [\n";
++    for (std::size_t i = 0; i < session->steps.size(); ++i)
++    {
++      json += fmt::format("    {{\"step\": {}, \"label\": \"{}\", \"instruction\": \"{}\"}}{}\n",
++                          i + 1, JsonEscape(session->steps[i].label),
++                          JsonEscape(session->steps[i].instruction),
++                          i + 1 < session->steps.size() ? "," : "");
++    }
++    json += "  ],\n";
++    json += "  \"entries\": [\n";
++    for (std::size_t i = 0; i < session->entries.size(); ++i)
++    {
++      const Entry& e = session->entries[i];
++      json += "    {";
++      json += fmt::format("\"index\": {}, ", e.index);
++      json += fmt::format("\"step\": {}, ", e.step >= 0 ? e.step + 1 : 0);
++      json += fmt::format("\"label\": \"{}\", ", JsonEscape(e.label));
++      json += fmt::format("\"status\": \"{}\", ", StatusName(static_cast<int>(e.status)));
++      json += fmt::format("\"file\": \"{}\", ", JsonEscape(e.file));
++      json += fmt::format("\"game_id\": \"{}\", ", JsonEscape(e.game_id));
++      json += fmt::format("\"frame\": {}, ", e.frame);
++      json += fmt::format("\"time\": \"{}\", ", JsonEscape(e.time));
++      json += fmt::format("\"mem1_size\": {}, \"mem2_size\": {}, ", e.mem1_size, e.mem2_size);
++      json += fmt::format("\"bytes\": {}, ", e.bytes);
++      json += fmt::format("\"error\": \"{}\"", JsonEscape(e.error));
++      json += fmt::format("}}{}\n", i + 1 < session->entries.size() ? "," : "");
++    }
++    json += "  ]\n}\n";
++  }
++
++  const std::string temp = path + ".tmp";
++  if (!File::WriteStringToFile(temp, json) || !File::Rename(temp, path))
++  {
++    File::Delete(temp, File::IfAbsentBehavior::NoConsoleWarning);
++    std::lock_guard lk(m_mutex);
++    SetStatusLocked("Couldn't write manifest.json.", StatusKind::Error);
++  }
++}
++
++// ---------------------------------------------------------------------------------------------
++// Video thread
++
++OverlayState DevTools::GetOverlayState()
++{
++  std::lock_guard lk(m_mutex);
++  OverlayState state;
++  state.visible = m_visible;
++  if (!m_visible)
++    return state;
++
++  state.folder = GetFolder();
++  state.file_errors = m_file_errors;
++  state.status = m_status;
++  state.status_kind = m_status_kind;
++  state.capture_waiting = m_capture_requested;
++  state.captures_saved = CountEntriesLocked(EntryStatus::Saved);
++  state.captures_saving = m_captures_in_flight;
++  state.recording = m_recording;
++
++  if (m_session && !m_session->steps.empty())
++  {
++    state.has_session = true;
++    state.session_title = m_session->title;
++    state.step_count = static_cast<int>(m_session->steps.size());
++    state.step_number = static_cast<int>(m_step) + 1;
++    state.session_complete = m_step >= m_session->steps.size();
++    if (!state.session_complete)
++    {
++      state.step_label = m_session->steps[m_step].label;
++      state.step_instruction = m_session->steps[m_step].instruction;
++    }
++  }
++
++  state.watch.reserve(m_watches.size());
++  for (std::size_t i = 0; i < m_watches.size(); ++i)
++    state.watch.emplace_back(m_watches[i].name, i < m_watch_values.size() ? m_watch_values[i] : "-");
++  return state;
++}
++}  // namespace RoguelikeDev
+diff --git a/Source/Core/Core/RoguelikeDev/DevTools.h b/Source/Core/Core/RoguelikeDev/DevTools.h
+new file mode 100644
+index 0000000..b28e6de
+--- /dev/null
++++ b/Source/Core/Core/RoguelikeDev/DevTools.h
+@@ -0,0 +1,209 @@
++// Copyright 2026 Dolphin Emulator Project
++// SPDX-License-Identifier: GPL-2.0-or-later
++
++// Research tools for the Skylanders roguelike build.
++//
++// Guided capture sessions: session.txt lists steps ("get hit once, then press End"). Each press
++// saves a compressed snapshot of MEM1 + MEM2 plus a manifest entry, so memory addresses can be
++// found offline by comparing snapshots. Watch list: watch.txt lists addresses (optionally through
++// pointer chains) to show live on screen and to record to CSV.
++//
++// Threads: hotkeys call the request functions, the CPU thread calls OnFrameEnd (memory is only
++// read there), a worker thread compresses and writes files, and the video thread reads
++// GetOverlayState.
++
++#pragma once
++
++#include <chrono>
++#include <condition_variable>
++#include <cstdint>
++#include <deque>
++#include <memory>
++#include <mutex>
++#include <string>
++#include <thread>
++#include <vector>
++
++#include "Common/IOFile.h"
++#include "Core/RoguelikeDev/DevToolsParse.h"
++
++namespace Core
++{
++class System;
++}
++
++namespace RoguelikeDev
++{
++enum class StatusKind
++{
++  Info,
++  Ok,
++  Error,
++};
++
++struct OverlayState
++{
++  bool visible = false;
++  std::string folder;
++
++  bool has_session = false;
++  std::string session_title;
++  int step_number = 0;  // 1-based; step_count + 1 once complete
++  int step_count = 0;
++  std::string step_label;
++  std::string step_instruction;
++  bool session_complete = false;
++  bool capture_waiting = false;
++
++  int captures_saved = 0;
++  int captures_saving = 0;
++
++  std::string status;
++  StatusKind status_kind = StatusKind::Info;
++
++  bool recording = false;
++  std::vector<std::pair<std::string, std::string>> watch;  // name, formatted value
++
++  std::vector<std::string> file_errors;
++};
++
++class DevTools
++{
++public:
++  static DevTools& GetInstance();
++
++  DevTools(const DevTools&) = delete;
++  DevTools& operator=(const DevTools&) = delete;
++
++  // Hotkey thread. Capture/Undo/Skip/ToggleRecording expect the game to be running.
++  void RequestCapture();
++  void Undo();
++  void Skip();
++  void ToggleOverlay();
++  void ToggleRecording();
++  void ReloadFiles();
++
++  // CPU thread, once per emulated frame.
++  void OnFrameEnd(Core::System& system);
++
++  // Video thread.
++  OverlayState GetOverlayState();
++
++  static std::string GetFolder();
++
++private:
++  enum class EntryStatus
++  {
++    Saving,
++    Saved,
++    Failed,
++    Skipped,
++    Discarded,
++  };
++
++  struct Entry
++  {
++    int index = 0;  // 1-based capture number within the session
++    int step = -1;  // 0-based step, -1 for a capture after the script ended
++    std::string label;
++    std::string instruction;
++    std::string file;  // empty for skipped steps
++    EntryStatus status = EntryStatus::Saving;
++    std::string game_id;
++    std::uint64_t frame = 0;
++    std::string time;
++    std::uint64_t bytes = 0;
++    std::uint32_t mem1_size = 0;
++    std::uint32_t mem2_size = 0;
++    std::string error;
++  };
++
++  struct Session
++  {
++    std::string title;
++    std::vector<SessionStep> steps;
++    std::string dir;  // empty until the first capture or skip
++    std::string started;
++    std::vector<Entry> entries;
++  };
++
++  struct Action
++  {
++    bool is_capture = false;
++    int step = -1;
++    std::size_t entry = 0;
++  };
++
++  struct Job
++  {
++    enum class Kind
++    {
++      Capture,
++      Delete,
++      Manifest,
++    };
++    Kind kind = Kind::Manifest;
++    std::shared_ptr<Session> session;
++    std::size_t entry = 0;
++    std::unique_ptr<std::uint8_t[]> data;
++    std::size_t size = 0;
++    std::string path;
++  };
++
++  DevTools();
++  ~DevTools();
++
++  // All of these expect m_mutex to be held.
++  void EnsureLoadedLocked();
++  void LoadFilesLocked();
++  void StartSessionLocked();
++  bool EnsureSessionDirLocked();
++  void SetStatusLocked(std::string text, StatusKind kind);
++  void QueueJobLocked(Job job);
++  void QueueManifestLocked();
++  int CountEntriesLocked(EntryStatus status) const;
++
++  void TakeCapture(Core::System& system);
++  void SampleWatches(Core::System& system);
++  void StartRecordingLocked();
++  void StopRecordingLocked();
++
++  void WorkerLoop();
++  void RunJob(Job& job);
++  void WriteManifest(const std::shared_ptr<Session>& session);
++
++  mutable std::mutex m_mutex;
++
++  bool m_loaded = false;
++  bool m_visible = false;
++  std::vector<std::string> m_file_errors;
++
++  std::shared_ptr<Session> m_session;
++  std::size_t m_step = 0;
++  std::vector<Action> m_history;
++
++  bool m_capture_requested = false;
++  std::size_t m_capture_request_step = 0;
++  std::chrono::steady_clock::time_point m_capture_request_time;
++
++  std::vector<WatchEntry> m_watches;
++  std::vector<std::string> m_watch_values;
++  std::vector<std::string> m_watch_csv_values;
++  bool m_recording_wanted = false;
++  bool m_recording = false;
++  File::IOFile m_csv;
++  int m_csv_rows_since_flush = 0;
++  std::uint64_t m_frame = 0;
++  std::chrono::steady_clock::time_point m_recording_start;
++
++  std::string m_status;
++  StatusKind m_status_kind = StatusKind::Info;
++
++  // Worker
++  std::deque<Job> m_jobs;
++  int m_captures_in_flight = 0;
++  std::condition_variable m_jobs_cv;
++  bool m_stop = false;
++  std::thread m_worker;
++};
++}  // namespace RoguelikeDev
+diff --git a/Source/Core/Core/RoguelikeDev/DevToolsParse.cpp b/Source/Core/Core/RoguelikeDev/DevToolsParse.cpp
+new file mode 100644
+index 0000000..f810e27
+--- /dev/null
++++ b/Source/Core/Core/RoguelikeDev/DevToolsParse.cpp
+@@ -0,0 +1,462 @@
++// Copyright 2026 Dolphin Emulator Project
++// SPDX-License-Identifier: GPL-2.0-or-later
++
++#include "Core/RoguelikeDev/DevToolsParse.h"
++
++#include <array>
++#include <bit>
++#include <cctype>
++#include <charconv>
++#include <cmath>
++#include <cstdio>
++#include <limits>
++
++namespace RoguelikeDev
++{
++namespace
++{
++constexpr std::string_view UTF8_BOM = "\xEF\xBB\xBF";
++
++// Splits into lines, accepting \n, \r\n and lone \r. Strips a leading UTF-8 BOM.
++std::vector<std::string_view> SplitLines(std::string_view text)
++{
++  if (text.starts_with(UTF8_BOM))
++    text.remove_prefix(UTF8_BOM.size());
++
++  std::vector<std::string_view> lines;
++  std::size_t start = 0;
++  for (std::size_t i = 0; i < text.size(); ++i)
++  {
++    if (text[i] == '\n' || text[i] == '\r')
++    {
++      lines.push_back(text.substr(start, i - start));
++      if (text[i] == '\r' && i + 1 < text.size() && text[i + 1] == '\n')
++        ++i;
++      start = i + 1;
++    }
++  }
++  if (start < text.size())
++    lines.push_back(text.substr(start));
++  return lines;
++}
++
++std::vector<std::string_view> Split(std::string_view text, char separator)
++{
++  std::vector<std::string_view> parts;
++  std::size_t start = 0;
++  while (true)
++  {
++    const std::size_t pos = text.find(separator, start);
++    if (pos == std::string_view::npos)
++    {
++      parts.push_back(text.substr(start));
++      return parts;
++    }
++    parts.push_back(text.substr(start, pos - start));
++    start = pos + 1;
++  }
++}
++
++bool IsSpace(char c)
++{
++  return c == ' ' || c == '\t' || c == '\v' || c == '\f';
++}
++
++char ToLowerAscii(char c)
++{
++  return (c >= 'A' && c <= 'Z') ? static_cast<char>(c - 'A' + 'a') : c;
++}
++
++std::string ToLower(std::string_view text)
++{
++  std::string out(text);
++  for (char& c : out)
++    c = ToLowerAscii(c);
++  return out;
++}
++
++bool IsCommentOrBlank(std::string_view line)
++{
++  return line.empty() || line.front() == '#';
++}
++
++// Parses an unsigned number in decimal or 0x-prefixed hex. The whole string must be consumed.
++std::optional<std::uint64_t> ParseUnsigned(std::string_view text)
++{
++  text = Trim(text);
++  if (text.empty())
++    return std::nullopt;
++
++  int base = 10;
++  if (text.size() > 2 && text[0] == '0' && (text[1] == 'x' || text[1] == 'X'))
++  {
++    base = 16;
++    text.remove_prefix(2);
++  }
++  else if (text.size() > 1 && (text[0] == '$'))
++  {
++    base = 16;
++    text.remove_prefix(1);
++  }
++
++  std::uint64_t value = 0;
++  const auto [ptr, ec] = std::from_chars(text.data(), text.data() + text.size(), value, base);
++  if (ec != std::errc() || ptr != text.data() + text.size())
++    return std::nullopt;
++  return value;
++}
++
++std::optional<WatchType> ParseWatchType(std::string_view text)
++{
++  static constexpr std::array<std::pair<std::string_view, WatchType>, 13> types{{
++      {"u8", WatchType::U8},
++      {"u16", WatchType::U16},
++      {"u32", WatchType::U32},
++      {"s8", WatchType::S8},
++      {"s16", WatchType::S16},
++      {"s32", WatchType::S32},
++      {"i8", WatchType::S8},
++      {"i16", WatchType::S16},
++      {"i32", WatchType::S32},
++      {"f32", WatchType::F32},
++      {"float", WatchType::F32},
++      {"f64", WatchType::F64},
++      {"hex", WatchType::Hex32},
++  }};
++  const std::string lower = ToLower(Trim(text));
++  for (const auto& [name, type] : types)
++  {
++    if (lower == name)
++      return type;
++  }
++  if (lower == "hex32" || lower == "x32")
++    return WatchType::Hex32;
++  if (lower == "double")
++    return WatchType::F64;
++  return std::nullopt;
++}
++
++std::string FormatFloating(double value)
++{
++  if (std::isnan(value))
++    return "NaN";
++  if (std::isinf(value))
++    return value > 0 ? "inf" : "-inf";
++  std::array<char, 64> buffer{};
++  std::snprintf(buffer.data(), buffer.size(), "%.6g", value);
++  return buffer.data();
++}
++}  // namespace
++
++std::string_view Trim(std::string_view text)
++{
++  while (!text.empty() && IsSpace(text.front()))
++    text.remove_prefix(1);
++  while (!text.empty() && IsSpace(text.back()))
++    text.remove_suffix(1);
++  return text;
++}
++
++std::optional<std::uint32_t> ParseAddress(std::string_view text)
++{
++  const auto value = ParseUnsigned(text);
++  if (!value || *value > std::numeric_limits<std::uint32_t>::max())
++    return std::nullopt;
++  return static_cast<std::uint32_t>(*value);
++}
++
++std::optional<std::int64_t> ParseOffset(std::string_view text)
++{
++  text = Trim(text);
++  bool negative = false;
++  if (!text.empty() && (text.front() == '-' || text.front() == '+'))
++  {
++    negative = text.front() == '-';
++    text.remove_prefix(1);
++  }
++  const auto value = ParseUnsigned(text);
++  if (!value || *value > 0x7FFFFFFFull)
++    return std::nullopt;
++  const auto signed_value = static_cast<std::int64_t>(*value);
++  return negative ? -signed_value : signed_value;
++}
++
++std::string SanitizeLabel(std::string_view text)
++{
++  std::string out;
++  bool last_was_underscore = false;
++  for (const char raw : Trim(text))
++  {
++    const char c = ToLowerAscii(raw);
++    if ((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '-')
++    {
++      out.push_back(c);
++      last_was_underscore = false;
++    }
++    else if ((c == '_' || IsSpace(c) || c == '.' || c == '/') && !out.empty() &&
++             !last_was_underscore)
++    {
++      out.push_back('_');
++      last_was_underscore = true;
++    }
++    if (out.size() >= MAX_LABEL_LENGTH)
++      break;
++  }
++  while (!out.empty() && out.back() == '_')
++    out.pop_back();
++  return out;
++}
++
++SessionScript ParseSessionScript(std::string_view text)
++{
++  SessionScript script;
++  int line_number = 0;
++  for (std::string_view raw_line : SplitLines(text))
++  {
++    ++line_number;
++    const std::string_view line = Trim(raw_line);
++    if (IsCommentOrBlank(line))
++      continue;
++
++    const std::string lower = ToLower(line.substr(0, 6));
++    if (lower == "title:")
++    {
++      script.title = std::string(Trim(line.substr(6)));
++      continue;
++    }
++
++    if (script.steps.size() >= MAX_SESSION_STEPS)
++    {
++      script.errors.push_back({line_number, "Too many steps; the rest are ignored."});
++      break;
++    }
++
++    SessionStep step;
++    const std::size_t bar = line.find('|');
++    const std::size_t step_number = script.steps.size() + 1;
++    if (bar == std::string_view::npos)
++    {
++      step.instruction = std::string(line);
++    }
++    else
++    {
++      step.label = SanitizeLabel(line.substr(0, bar));
++      step.instruction = std::string(Trim(line.substr(bar + 1)));
++    }
++    if (step.label.empty())
++      step.label = "step_" + std::to_string(step_number);
++    if (step.instruction.empty())
++    {
++      script.errors.push_back({line_number, "Step has no instruction."});
++      step.instruction = "(no instruction)";
++    }
++    script.steps.push_back(std::move(step));
++  }
++  return script;
++}
++
++WatchList ParseWatchList(std::string_view text)
++{
++  WatchList list;
++  int line_number = 0;
++  for (std::string_view raw_line : SplitLines(text))
++  {
++    ++line_number;
++    const std::string_view line = Trim(raw_line);
++    if (IsCommentOrBlank(line))
++      continue;
++
++    if (list.entries.size() >= MAX_WATCH_ENTRIES)
++    {
++      list.errors.push_back({line_number, "Too many watches; the rest are ignored."});
++      break;
++    }
++
++    const auto fields = Split(line, '|');
++    if (fields.size() != 3)
++    {
++      list.errors.push_back({line_number, "Expected: name | type | address"});
++      continue;
++    }
++
++    WatchEntry entry;
++    entry.name = std::string(Trim(fields[0]));
++    if (entry.name.empty())
++    {
++      list.errors.push_back({line_number, "Missing name."});
++      continue;
++    }
++    if (entry.name.size() > MAX_NAME_LENGTH)
++      entry.name.resize(MAX_NAME_LENGTH);
++
++    const auto type = ParseWatchType(fields[1]);
++    if (!type)
++    {
++      list.errors.push_back({line_number, "Unknown type (use u8 u16 u32 s8 s16 s32 f32 f64 hex)."});
++      continue;
++    }
++    entry.type = *type;
++
++    const auto path = Split(fields[2], '>');
++    const auto base = ParseAddress(path[0]);
++    if (!base)
++    {
++      list.errors.push_back({line_number, "Bad address."});
++      continue;
++    }
++    entry.base = *base;
++
++    bool ok = true;
++    for (std::size_t i = 1; i < path.size(); ++i)
++    {
++      const auto offset = ParseOffset(path[i]);
++      if (!offset)
++      {
++        list.errors.push_back({line_number, "Bad pointer offset."});
++        ok = false;
++        break;
++      }
++      entry.offsets.push_back(*offset);
++    }
++    if (!ok)
++      continue;
++    if (entry.offsets.size() > MAX_WATCH_OFFSETS)
++    {
++      list.errors.push_back({line_number, "Too many pointer offsets."});
++      continue;
++    }
++
++    list.entries.push_back(std::move(entry));
++  }
++  return list;
++}
++
++std::size_t WatchTypeSize(WatchType type)
++{
++  switch (type)
++  {
++  case WatchType::U8:
++  case WatchType::S8:
++    return 1;
++  case WatchType::U16:
++  case WatchType::S16:
++    return 2;
++  case WatchType::F64:
++    return 8;
++  case WatchType::U32:
++  case WatchType::S32:
++  case WatchType::F32:
++  case WatchType::Hex32:
++    return 4;
++  }
++  return 4;
++}
++
++std::string FormatWatchValue(WatchType type, std::uint64_t raw)
++{
++  switch (type)
++  {
++  case WatchType::U8:
++    return std::to_string(static_cast<std::uint8_t>(raw));
++  case WatchType::U16:
++    return std::to_string(static_cast<std::uint16_t>(raw));
++  case WatchType::U32:
++    return std::to_string(static_cast<std::uint32_t>(raw));
++  case WatchType::S8:
++    return std::to_string(static_cast<std::int8_t>(static_cast<std::uint8_t>(raw)));
++  case WatchType::S16:
++    return std::to_string(static_cast<std::int16_t>(static_cast<std::uint16_t>(raw)));
++  case WatchType::S32:
++    return std::to_string(static_cast<std::int32_t>(static_cast<std::uint32_t>(raw)));
++  case WatchType::F32:
++    return FormatFloating(std::bit_cast<float>(static_cast<std::uint32_t>(raw)));
++  case WatchType::F64:
++    return FormatFloating(std::bit_cast<double>(raw));
++  case WatchType::Hex32:
++  {
++    std::array<char, 16> buffer{};
++    std::snprintf(buffer.data(), buffer.size(), "0x%08X", static_cast<unsigned>(raw & 0xFFFFFFFFu));
++    return buffer.data();
++  }
++  }
++  return "?";
++}
++
++std::array<std::uint8_t, SNAPSHOT_HEADER_SIZE> MakeSnapshotHeader(std::uint32_t mem1_size,
++                                                                  std::uint32_t mem2_size,
++                                                                  std::uint64_t frame,
++                                                                  std::string_view game_id)
++{
++  std::array<std::uint8_t, SNAPSHOT_HEADER_SIZE> header{};
++  const auto put = [&header](std::size_t offset, std::uint64_t value, int bytes) {
++    for (int i = 0; i < bytes; ++i)
++      header[offset + i] = static_cast<std::uint8_t>(value >> (8 * i));
++  };
++  constexpr std::string_view magic = "SKRLSNAP";
++  for (std::size_t i = 0; i < magic.size(); ++i)
++    header[i] = static_cast<std::uint8_t>(magic[i]);
++  put(8, SNAPSHOT_VERSION, 4);
++  put(12, SNAPSHOT_HEADER_SIZE, 4);
++  put(16, mem1_size, 4);
++  put(20, mem2_size, 4);
++  put(24, frame, 8);
++  for (std::size_t i = 0; i < game_id.size() && i < 16; ++i)
++    header[32 + i] = static_cast<std::uint8_t>(game_id[i]);
++  return header;
++}
++
++std::string JsonEscape(std::string_view text)
++{
++  std::string out;
++  out.reserve(text.size() + 8);
++  for (const char c : text)
++  {
++    switch (c)
++    {
++    case '"':
++      out += "\\\"";
++      break;
++    case '\\':
++      out += "\\\\";
++      break;
++    case '\n':
++      out += "\\n";
++      break;
++    case '\r':
++      out += "\\r";
++      break;
++    case '\t':
++      out += "\\t";
++      break;
++    default:
++      if (static_cast<unsigned char>(c) < 0x20)
++      {
++        std::array<char, 8> buffer{};
++        std::snprintf(buffer.data(), buffer.size(), "\\u%04x", static_cast<unsigned>(c));
++        out += buffer.data();
++      }
++      else
++      {
++        out.push_back(c);
++      }
++    }
++  }
++  return out;
++}
++
++std::string CsvEscape(std::string_view text)
++{
++  if (text.find_first_of(",\"\r\n") == std::string_view::npos)
++    return std::string(text);
++  std::string out = "\"";
++  for (const char c : text)
++  {
++    if (c == '"')
++      out += "\"\"";
++    else
++      out.push_back(c);
++  }
++  out += '"';
++  return out;
++}
++}  // namespace RoguelikeDev
+diff --git a/Source/Core/Core/RoguelikeDev/DevToolsParse.h b/Source/Core/Core/RoguelikeDev/DevToolsParse.h
+new file mode 100644
+index 0000000..773b4e7
+--- /dev/null
++++ b/Source/Core/Core/RoguelikeDev/DevToolsParse.h
+@@ -0,0 +1,111 @@
++// Copyright 2026 Dolphin Emulator Project
++// SPDX-License-Identifier: GPL-2.0-or-later
++
++// Plain-text formats used by the Skylanders roguelike dev tools. Kept free of Dolphin
++// dependencies so it can be unit-tested on its own.
++
++#pragma once
++
++#include <array>
++#include <cstdint>
++#include <optional>
++#include <string>
++#include <string_view>
++#include <vector>
++
++namespace RoguelikeDev
++{
++constexpr std::size_t MAX_SESSION_STEPS = 200;
++constexpr std::size_t MAX_WATCH_ENTRIES = 64;
++constexpr std::size_t MAX_WATCH_OFFSETS = 8;
++constexpr std::size_t MAX_LABEL_LENGTH = 40;
++constexpr std::size_t MAX_NAME_LENGTH = 40;
++
++struct ParseError
++{
++  int line = 0;  // 1-based
++  std::string message;
++};
++
++// session.txt
++//   # comment
++//   title: Gold and health
++//   full_hp | Stand still at full health, then press End.
++struct SessionStep
++{
++  std::string label;
++  std::string instruction;
++};
++
++struct SessionScript
++{
++  std::string title;
++  std::vector<SessionStep> steps;
++  std::vector<ParseError> errors;
++};
++
++SessionScript ParseSessionScript(std::string_view text);
++
++// watch.txt
++//   # name | type | address [> offset ...]
++//   Gold | u32 | 0x80A1B2C0
++//   Health | f32 | 0x80701234 > 0x10 > 0x1A4
++// Each "> offset" reads a 32-bit pointer at the current address and adds the offset to it.
++enum class WatchType
++{
++  U8,
++  U16,
++  U32,
++  S8,
++  S16,
++  S32,
++  F32,
++  F64,
++  Hex32,
++};
++
++struct WatchEntry
++{
++  std::string name;
++  WatchType type = WatchType::U32;
++  std::uint32_t base = 0;
++  std::vector<std::int64_t> offsets;
++};
++
++struct WatchList
++{
++  std::vector<WatchEntry> entries;
++  std::vector<ParseError> errors;
++};
++
++WatchList ParseWatchList(std::string_view text);
++
++// Size in bytes of a value of the given type.
++std::size_t WatchTypeSize(WatchType type);
++// Formats a raw big-endian-decoded value (already byte-swapped to host order and zero-extended).
++std::string FormatWatchValue(WatchType type, std::uint64_t raw);
++
++// Lower-case, [a-z0-9_-] only, at most MAX_LABEL_LENGTH characters. Empty if nothing survives.
++std::string SanitizeLabel(std::string_view text);
++std::string JsonEscape(std::string_view text);
++std::string CsvEscape(std::string_view text);
++
++// Snapshot files: zstd( header + MEM1 + MEM2 ). Header fields are little-endian:
++//   0  char[8]  "SKRLSNAP"
++//   8  u32      version (1)
++//   12 u32      header size (48)
++//   16 u32      MEM1 size
++//   20 u32      MEM2 size (0 on GameCube)
++//   24 u64      frame number
++//   32 char[16] game ID, zero-padded
++constexpr std::uint32_t SNAPSHOT_VERSION = 1;
++constexpr std::size_t SNAPSHOT_HEADER_SIZE = 48;
++std::array<std::uint8_t, SNAPSHOT_HEADER_SIZE> MakeSnapshotHeader(std::uint32_t mem1_size,
++                                                                  std::uint32_t mem2_size,
++                                                                  std::uint64_t frame,
++                                                                  std::string_view game_id);
++
++std::optional<std::uint32_t> ParseAddress(std::string_view text);
++std::optional<std::int64_t> ParseOffset(std::string_view text);
++std::string_view Trim(std::string_view text);
++}  // namespace RoguelikeDev
+diff --git a/Source/Core/DolphinQt/Config/Mapping/HotkeyUSBEmu.cpp b/Source/Core/DolphinQt/Config/Mapping/HotkeyUSBEmu.cpp
+index a92df83..16278af 100644
+--- a/Source/Core/DolphinQt/Config/Mapping/HotkeyUSBEmu.cpp
++++ b/Source/Core/DolphinQt/Config/Mapping/HotkeyUSBEmu.cpp
+@@ -19,6 +19,8 @@ void HotkeyUSBEmu::CreateMainLayout()
+ 
+   m_main_layout->addWidget(
+       CreateGroupBox(tr("USB Device Emulation"), HotkeyManagerEmu::GetHotkeyGroup(HKGP_USB_EMU)));
++  m_main_layout->addWidget(CreateGroupBox(tr("Roguelike Dev Tools"),
++                                          HotkeyManagerEmu::GetHotkeyGroup(HKGP_ROGUELIKE_DEV)));
+ 
+   setLayout(m_main_layout);
+ }
+diff --git a/Source/Core/DolphinQt/HotkeyScheduler.cpp b/Source/Core/DolphinQt/HotkeyScheduler.cpp
+index f972d36..6fa33cc 100644
+--- a/Source/Core/DolphinQt/HotkeyScheduler.cpp
++++ b/Source/Core/DolphinQt/HotkeyScheduler.cpp
+@@ -27,6 +27,7 @@
+ #include "Core/FreeLookManager.h"
+ #include "Core/HotkeyManager.h"
+ #include "Core/IOS/IOS.h"
++#include "Core/RoguelikeDev/DevTools.h"
+ #include "Core/State.h"
+ #include "Core/System.h"
+ #include "Core/WiiUtils.h"
+@@ -148,6 +149,39 @@ void HotkeyScheduler::CloseSkylanderQuickMenu()
+   m_quick_menu_release_pending = true;
+ }
+ 
++void HotkeyScheduler::HandleRoguelikeDevTools(bool emulation_running)
++{
++  auto& dev = RoguelikeDev::DevTools::GetInstance();
++
++  if (IsHotkey(HK_ROGUELIKE_DEV_TOGGLE_PANEL))
++    dev.ToggleOverlay();
++  if (IsHotkey(HK_ROGUELIKE_DEV_RELOAD))
++    dev.ReloadFiles();
++
++  const bool capture = IsHotkey(HK_ROGUELIKE_DEV_CAPTURE);
++  const bool skip = IsHotkey(HK_ROGUELIKE_DEV_SKIP);
++  const bool undo = IsHotkey(HK_ROGUELIKE_DEV_UNDO);
++  const bool record = IsHotkey(HK_ROGUELIKE_DEV_TOGGLE_RECORDING);
++  if (!(capture || skip || undo || record))
++    return;
++
++  if (!emulation_running)
++  {
++    OSD::AddMessage("Dev tools: start (or unpause) the game first.", OSD::Duration::NORMAL,
++                    OSD::Color::RED);
++    return;
++  }
++
++  if (capture)
++    dev.RequestCapture();
++  if (skip)
++    dev.Skip();
++  if (undo)
++    dev.Undo();
++  if (record)
++    dev.ToggleRecording();
++}
++
+ void HotkeyScheduler::HandleSkylanderQuickMenu(bool emulation_running)
+ {
+   using SteadyClock = std::chrono::steady_clock;
+@@ -301,6 +335,7 @@ void HotkeyScheduler::Run()
+ #endif  // USE_RETRO_ACHIEVEMENTS
+ 
+       HandleSkylanderQuickMenu(Core::GetState(system) == Core::State::Running);
++      HandleRoguelikeDevTools(Core::GetState(system) == Core::State::Running);
+ 
+       if (Core::IsUninitialized(system))
+       {
+diff --git a/Source/Core/DolphinQt/HotkeyScheduler.h b/Source/Core/DolphinQt/HotkeyScheduler.h
+index 8390bbd..52b14f5 100644
+--- a/Source/Core/DolphinQt/HotkeyScheduler.h
++++ b/Source/Core/DolphinQt/HotkeyScheduler.h
+@@ -84,6 +84,7 @@ private:
+   void CheckDebuggingHotkeys();
+   void CheckGBAHotkeys();
+   void HandleSkylanderQuickMenu(bool emulation_running);
++  void HandleRoguelikeDevTools(bool emulation_running);
+   void CloseSkylanderQuickMenu();
+ 
+   struct RepeatState
+diff --git a/Source/Core/VideoCommon/CMakeLists.txt b/Source/Core/VideoCommon/CMakeLists.txt
+index 615592b..c0864e9 100644
+--- a/Source/Core/VideoCommon/CMakeLists.txt
++++ b/Source/Core/VideoCommon/CMakeLists.txt
+@@ -126,6 +126,8 @@ add_library(videocommon
+   OnScreenUI.cpp
+   OnScreenUI.h
+   OnScreenUIKeyMap.h
++  RoguelikeDevOverlay.cpp
++  RoguelikeDevOverlay.h
+   SkylanderQuickMenu.cpp
+   SkylanderQuickMenu.h
+   OpcodeDecoding.cpp
+diff --git a/Source/Core/VideoCommon/OnScreenUI.cpp b/Source/Core/VideoCommon/OnScreenUI.cpp
+index 3e0cf09..0b232a7 100644
+--- a/Source/Core/VideoCommon/OnScreenUI.cpp
++++ b/Source/Core/VideoCommon/OnScreenUI.cpp
+@@ -26,6 +26,7 @@
+ #include "VideoCommon/NetPlayGolfUI.h"
+ #include "VideoCommon/OnScreenDisplay.h"
+ #include "VideoCommon/PerformanceMetrics.h"
++#include "VideoCommon/RoguelikeDevOverlay.h"
+ #include "VideoCommon/SkylanderQuickMenu.h"
+ #include "VideoCommon/Present.h"
+ #include "VideoCommon/Statistics.h"
+@@ -424,6 +425,7 @@ void OnScreenUI::Finalize()
+   DrawDebugText();
+   OSD::DrawMessages();
+   DrawChallengesAndLeaderboards();
++  DrawRoguelikeDevOverlay();
+   SkylanderQuickMenu::GetInstance().Display();
+   ImGui::Render();
+ 
+diff --git a/Source/Core/VideoCommon/RoguelikeDevOverlay.cpp b/Source/Core/VideoCommon/RoguelikeDevOverlay.cpp
+new file mode 100644
+index 0000000..8fa4a90
+--- /dev/null
++++ b/Source/Core/VideoCommon/RoguelikeDevOverlay.cpp
+@@ -0,0 +1,154 @@
++// Copyright 2026 Dolphin Emulator Project
++// SPDX-License-Identifier: GPL-2.0-or-later
++
++#include "VideoCommon/RoguelikeDevOverlay.h"
++
++#include <algorithm>
++#include <string>
++
++#include <fmt/format.h>
++#include <imgui.h>
++
++#include "Core/RoguelikeDev/DevTools.h"
++
++namespace VideoCommon
++{
++namespace
++{
++constexpr ImU32 COLOR_BG = IM_COL32(12, 14, 22, 255);
++constexpr ImU32 COLOR_BORDER = IM_COL32(255, 196, 64, 255);
++constexpr ImU32 COLOR_TITLE = IM_COL32(255, 196, 64, 255);
++constexpr ImU32 COLOR_TEXT = IM_COL32(235, 235, 240, 255);
++constexpr ImU32 COLOR_DIM = IM_COL32(150, 155, 170, 255);
++constexpr ImU32 COLOR_OK = IM_COL32(110, 230, 120, 255);
++constexpr ImU32 COLOR_ERROR = IM_COL32(255, 105, 95, 255);
++constexpr ImU32 COLOR_INFO = IM_COL32(120, 200, 255, 255);
++constexpr ImU32 COLOR_REC = IM_COL32(255, 70, 70, 255);
++constexpr std::size_t MAX_ERRORS_SHOWN = 4;
++
++void ColoredText(ImU32 color, const std::string& text)
++{
++  ImGui::PushStyleColor(ImGuiCol_Text, color);
++  ImGui::TextUnformatted(text.c_str(), text.c_str() + text.size());
++  ImGui::PopStyleColor();
++}
++
++void WrappedText(ImU32 color, const std::string& text)
++{
++  ImGui::PushStyleColor(ImGuiCol_Text, color);
++  ImGui::TextWrapped("%s", text.c_str());
++  ImGui::PopStyleColor();
++}
++}  // namespace
++
++void DrawRoguelikeDevOverlay()
++{
++  const RoguelikeDev::OverlayState state = RoguelikeDev::DevTools::GetInstance().GetOverlayState();
++  if (!state.visible)
++    return;
++
++  const ImGuiStyle& style = ImGui::GetStyle();
++  const ImVec2 display = ImGui::GetIO().DisplaySize;
++  if (display.x <= 0.0f || display.y <= 0.0f)
++    return;
++  const float global_scale = std::max(style.FontScaleMain * style.FontScaleDpi, 0.01f);
++  const float font_base = std::max(style.FontSizeBase, display.y / 46.0f / global_scale);
++  ImGui::PushFont(nullptr, font_base);
++
++  const float font = ImGui::GetFontSize();
++  const float pad = font * 0.5f;
++  const float width = std::min(display.x * 0.45f, font * 22.0f);
++
++  ImGui::SetNextWindowPos(ImVec2(pad, pad), ImGuiCond_Always);
++  ImGui::SetNextWindowSize(ImVec2(width, 0.0f), ImGuiCond_Always);
++  ImGui::SetNextWindowBgAlpha(0.88f);
++  ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(pad, pad));
++  ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, font * 0.35f);
++  ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(font * 0.4f, font * 0.25f));
++  ImGui::PushStyleColor(ImGuiCol_WindowBg, COLOR_BG);
++  ImGui::PushStyleColor(ImGuiCol_Border, COLOR_BORDER);
++
++  constexpr ImGuiWindowFlags flags =
++      ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove |
++      ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoNav |
++      ImGuiWindowFlags_NoInputs | ImGuiWindowFlags_NoFocusOnAppearing |
++      ImGuiWindowFlags_NoScrollbar;
++
++  if (ImGui::Begin("Roguelike Dev Tools", nullptr, flags))
++  {
++    ImGui::PushTextWrapPos(width - pad);
++
++    ColoredText(COLOR_TITLE, "ROGUELIKE DEV TOOLS");
++    if (state.recording)
++    {
++      ImGui::SameLine();
++      ColoredText(COLOR_REC, "  REC");
++    }
++
++    if (state.has_session)
++    {
++      ColoredText(COLOR_DIM, state.session_title);
++      if (state.session_complete)
++      {
++        WrappedText(COLOR_OK, "Session complete - every step is done. Extra presses of End save "
++                              "extra captures.");
++      }
++      else
++      {
++        ColoredText(COLOR_TEXT, fmt::format("Step {} of {}:  {}", state.step_number,
++                                            state.step_count, state.step_label));
++        WrappedText(COLOR_TEXT, state.step_instruction);
++      }
++      if (state.capture_waiting)
++        ColoredText(COLOR_INFO, "Capturing...");
++      ColoredText(COLOR_DIM, fmt::format("Saved: {}   Saving: {}", state.captures_saved,
++                                         state.captures_saving));
++      ColoredText(COLOR_DIM, "End capture   PgDn skip   Del undo");
++    }
++    else if (state.watch.empty())
++    {
++      WrappedText(COLOR_TEXT, "No session.txt or watch.txt loaded. Put them in:");
++      WrappedText(COLOR_DIM, state.folder);
++      ColoredText(COLOR_DIM, "PgUp reload   End free capture");
++    }
++
++    if (!state.watch.empty())
++    {
++      ImGui::Separator();
++      for (const auto& [name, value] : state.watch)
++        ColoredText(COLOR_TEXT, fmt::format("{}: {}", name, value));
++      ColoredText(COLOR_DIM, state.recording ? "Ins stop recording" : "Ins record to CSV");
++    }
++
++    if (!state.status.empty())
++    {
++      ImGui::Separator();
++      const ImU32 color = state.status_kind == RoguelikeDev::StatusKind::Error ? COLOR_ERROR :
++                          state.status_kind == RoguelikeDev::StatusKind::Ok    ? COLOR_OK :
++                                                                                 COLOR_INFO;
++      WrappedText(color, state.status);
++    }
++
++    if (!state.file_errors.empty())
++    {
++      ImGui::Separator();
++      const std::size_t shown = std::min(state.file_errors.size(), MAX_ERRORS_SHOWN);
++      for (std::size_t i = 0; i < shown; ++i)
++        WrappedText(COLOR_ERROR, state.file_errors[i]);
++      if (state.file_errors.size() > shown)
++      {
++        ColoredText(COLOR_ERROR,
++                    fmt::format("...and {} more (see the log).", state.file_errors.size() - shown));
++      }
++    }
++
++    ColoredText(COLOR_DIM, "Home hide   PgUp reload files");
++    ImGui::PopTextWrapPos();
++  }
++  ImGui::End();
++
++  ImGui::PopStyleColor(2);
++  ImGui::PopStyleVar(3);
++  ImGui::PopFont();
++}
++}  // namespace VideoCommon
+diff --git a/Source/Core/VideoCommon/RoguelikeDevOverlay.h b/Source/Core/VideoCommon/RoguelikeDevOverlay.h
+new file mode 100644
+index 0000000..03b1591
+--- /dev/null
++++ b/Source/Core/VideoCommon/RoguelikeDevOverlay.h
+@@ -0,0 +1,10 @@
++// Copyright 2026 Dolphin Emulator Project
++// SPDX-License-Identifier: GPL-2.0-or-later
++
++#pragma once
++
++namespace VideoCommon
++{
++// Draws the roguelike dev tools panel. Video thread, between ImGui::NewFrame and ImGui::Render.
++void DrawRoguelikeDevOverlay();
++}  // namespace VideoCommon

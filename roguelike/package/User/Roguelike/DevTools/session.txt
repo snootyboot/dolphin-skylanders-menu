@@ -1,0 +1,17 @@
+# Session 1 - finds gold, health, XP and position in memory.
+# Press End after each step. Page Down skips a step, Delete undoes the last one.
+title: Session 1 - gold, health, XP and position
+ready | Get into a level with one Skylander on the portal. Stand still at full health, then press End.
+still | Don't move or touch anything for 5 seconds, then press End.
+gold_1 | Pick up some gold. Wait until the gold counter stops, then press End.
+gold_2 | Pick up more gold. Wait until the counter stops, then press End.
+hit_1 | Let an enemy hit you once (lose some health, but don't get knocked out), then press End.
+hit_2 | Let an enemy hit you once more, then press End.
+heal | Eat food to get some health back, then press End.
+xp_1 | Defeat one enemy and wait a few seconds, then press End.
+xp_2 | Defeat another enemy and wait a few seconds, then press End.
+spot_a | Walk to a spot you'll remember and stand still, then press End.
+spot_b | Walk a good distance away and stand still, then press End.
+spot_a_again | Walk back to the first spot as closely as you can, stand still, then press End.
+still_2 | Don't move for 5 seconds, then press End.
+swap | Open the quick menu and swap to a different Skylander. Once they appear, stand still and press End.

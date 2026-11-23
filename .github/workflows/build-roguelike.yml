@@ -1,0 +1,95 @@
+name: Build Skylanders Roguelike (Windows x64)
+
+# Separate from build.yml: builds the roguelike on top of the quick menu patch and
+# publishes its own pre-release zip. The regular quick menu build is never touched.
+on:
+  push:
+    branches: [roguelike]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  DOLPHIN_TAG: 2609b
+  PACKAGE: Dolphin-2609b-SkylandersRoguelike-Dev
+
+jobs:
+  build:
+    runs-on: windows-2025-vs2026
+    timeout-minutes: 180
+    steps:
+      - name: Checkout patch repo
+        uses: actions/checkout@v4
+        with:
+          path: patchrepo
+
+      - name: Clone Dolphin ${{ env.DOLPHIN_TAG }}
+        shell: pwsh
+        run: |
+          git config --global core.longpaths true
+          git clone --branch $env:DOLPHIN_TAG --depth 1 https://github.com/dolphin-emu/dolphin.git dolphin
+          cd dolphin
+          git submodule update --init --recursive --depth 1 --jobs 8
+
+      - name: Apply patches (quick menu, then roguelike)
+        shell: pwsh
+        run: |
+          cd dolphin
+          git apply --whitespace=nowarn ../patchrepo/skylanders-quick-menu.patch
+          if ($LASTEXITCODE -ne 0) { throw "quick menu patch failed" }
+          git apply --whitespace=nowarn ../patchrepo/roguelike/roguelike.patch
+          if ($LASTEXITCODE -ne 0) { throw "roguelike patch failed" }
+          git status --short
+
+      - name: Set up MSVC
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Configure
+        shell: pwsh
+        run: |
+          cd dolphin
+          cmake --preset ninja-release-x64 -DENABLE_AUTOUPDATE=OFF -DENABLE_ANALYTICS=OFF -DENABLE_TESTS=OFF
+
+      - name: Build
+        shell: pwsh
+        run: |
+          cd dolphin
+          cmake --build --preset ninja-build-release-x64
+
+      - name: Package
+        shell: pwsh
+        run: |
+          $bin = "dolphin/build/release/x64/Binaries"
+          $out = $env:PACKAGE
+          New-Item -ItemType Directory $out | Out-Null
+          foreach ($l in "Sys","COPYING","Licenses","qt.conf") { if (Test-Path "$bin/$l") { Remove-Item -LiteralPath "$bin/$l" -Recurse -Force } }
+          Copy-Item "$bin/*" $out -Recurse
+          Copy-Item "dolphin/Data/Sys" "$out/Sys" -Recurse
+          Copy-Item "dolphin/COPYING" "$out/COPYING"
+          Copy-Item "dolphin/LICENSES" "$out/Licenses" -Recurse
+          Copy-Item "dolphin/Source/Core/DolphinQt/qt.conf.win" "$out/qt.conf"
+          # portable.txt keeps every setting and save inside this folder, separate from your
+          # normal Dolphin. Plus the current dev-tools session.
+          Copy-Item "patchrepo/roguelike/package/*" $out -Recurse -Force
+          Copy-Item "patchrepo/roguelike/README-ROGUELIKE.txt" "$out/README-ROGUELIKE.txt"
+          if (-not (Test-Path "$out/portable.txt")) { throw "portable.txt missing from package" }
+          Get-ChildItem $out -Recurse -Include *.pdb,*.ilk,*.lib,*.exp | Remove-Item
+          Compress-Archive -Path $out -DestinationPath "$out.zip"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.PACKAGE }}
+          path: ${{ env.PACKAGE }}.zip
+
+      - name: Publish pre-release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: roguelike-dev-${{ github.run_number }}
+          name: Skylanders Roguelike - dev tools (build ${{ github.run_number }})
+          prerelease: true
+          target_commitish: ${{ github.sha }}
+          files: ${{ env.PACKAGE }}.zip

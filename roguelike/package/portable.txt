@@ -1,0 +1,1 @@
+This file makes Dolphin keep all settings and saves in the User folder next to it.
