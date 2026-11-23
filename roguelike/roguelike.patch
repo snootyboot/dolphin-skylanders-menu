@@ -159,10 +159,10 @@ index d8e1878..629574d 100644
  };
 diff --git a/Source/Core/Core/Roguelike/Run.cpp b/Source/Core/Core/Roguelike/Run.cpp
 new file mode 100644
-index 0000000..a0b21b3
+index 0000000..635130d
 --- /dev/null
 +++ b/Source/Core/Core/Roguelike/Run.cpp
-@@ -0,0 +1,368 @@
+@@ -0,0 +1,401 @@
 +// Copyright 2026 Dolphin Emulator Project
 +// SPDX-License-Identifier: GPL-2.0-or-later
 +
@@ -191,6 +191,10 @@ index 0000000..a0b21b3
 +constexpr std::uint32_t PARSE_RETRY_INTERVAL = 30;  // frames
 +// A hub load this soon after entering a level is treated as part of the load, not a return.
 +constexpr std::uint64_t MIN_FRAMES_IN_LEVEL = 60 * 20;
++// Level state byte (session 4): 0 = Ruins/hub, 1 = in a level (also paused / quick menu),
++// 2 = results screen after clearing the level.
++constexpr std::uint32_t LEVEL_STATE_ADDRESS = 0x80FADF2B;
++constexpr std::uint8_t LEVEL_STATE_RESULTS = 2;
 +
 +std::optional<std::uint32_t> ReadU32(const Core::CPUThreadGuard& guard, std::uint32_t address)
 +{
@@ -266,6 +270,8 @@ index 0000000..a0b21b3
 +  m_targets = {};
 +  m_is_wii = false;
 +  m_complete = false;
++  m_over = false;
++  m_cleared = false;
 +  m_loop = 0;
 +  m_level = 0;
 +  m_in_level = false;
@@ -281,7 +287,19 @@ index 0000000..a0b21b3
 +  std::lock_guard lk(m_mutex);
 +
 +  if (m_in_level)
++  {
 +    ++m_frames_in_level;
++    if (!m_cleared)
++    {
++      const Core::CPUThreadGuard guard(system);
++      const auto state = PowerPC::MMU::HostTryRead<u8>(guard, LEVEL_STATE_ADDRESS);
++      if (state && state->value == LEVEL_STATE_RESULTS)
++      {
++        m_cleared = true;
++        INFO_LOG_FMT(CORE, "Roguelike: cleared {}", RUN_LEVELS[m_level].display_name);
++      }
++    }
++  }
 +
 +  if (!m_fst_valid)
 +  {
@@ -411,7 +429,7 @@ index 0000000..a0b21b3
 +  std::vector<Write> writes;
 +  writes.reserve(4 + RUN_LEVEL_COUNT * 2);
 +
-+  const bool active = !m_complete;
++  const bool active = !m_complete && !m_over;
 +  const Pair& current = m_targets[m_level];
 +  const auto desired = [&](int index) -> std::uint32_t {
 +    if (active)
@@ -478,7 +496,7 @@ index 0000000..a0b21b3
 +
 +void Run::HandleLoadedStemLocked(const std::string& stem)
 +{
-+  if (m_complete)
++  if (m_complete || m_over)
 +    return;
 +
 +  if (stem == RUN_LEVELS[m_level].file_stem)
@@ -486,16 +504,28 @@ index 0000000..a0b21b3
 +    if (!m_in_level)
 +    {
 +      m_in_level = true;
++      m_cleared = false;
 +      m_frames_in_level = 0;
 +      INFO_LOG_FMT(CORE, "Roguelike: entered {}", RUN_LEVELS[m_level].display_name);
 +    }
 +    return;
 +  }
 +
-+  if (StartsWith(stem, "Level_Hub") && m_in_level && m_frames_in_level >= MIN_FRAMES_IN_LEVEL)
++  if (!StartsWith(stem, "Level_Hub") || !m_in_level)
++    return;
++
++  if (m_cleared)
 +  {
 +    m_in_level = false;
++    m_cleared = false;
 +    AdvanceLocked();
++  }
++  else if (m_frames_in_level >= MIN_FRAMES_IN_LEVEL)
++  {
++    // Back in the Ruins without a results screen: the level was quit, which ends the run.
++    m_in_level = false;
++    m_over = true;
++    INFO_LOG_FMT(CORE, "Roguelike: quit {}, run over", RUN_LEVELS[m_level].display_name);
 +  }
 +}
 +
@@ -522,6 +552,9 @@ index 0000000..a0b21b3
 +  RunStatus status;
 +  status.show = m_fst_valid || !m_error.empty();
 +  status.complete = m_complete;
++  status.over = m_over;
++  if (m_over)
++    status.over_level = RUN_LEVELS[m_level].display_name;
 +  status.in_level = m_in_level;
 +  status.loop = m_loop + 1;
 +  status.level = m_level + 1;
@@ -533,10 +566,10 @@ index 0000000..a0b21b3
 +}  // namespace Roguelike
 diff --git a/Source/Core/Core/Roguelike/Run.h b/Source/Core/Core/Roguelike/Run.h
 new file mode 100644
-index 0000000..73bff17
+index 0000000..3e24d49
 --- /dev/null
 +++ b/Source/Core/Core/Roguelike/Run.h
-@@ -0,0 +1,133 @@
+@@ -0,0 +1,138 @@
 +// Copyright 2026 Dolphin Emulator Project
 +// SPDX-License-Identifier: GPL-2.0-or-later
 +
@@ -546,8 +579,9 @@ index 0000000..73bff17
 +// apploader leaves in MEM1. While a run is active, the FST entries of Shattered Island
 +// (Level_027_Tutorial) and the run's current level have their name offsets swapped, so picking
 +// Shattered Island on Flynn's map loads the current run level instead. Disc reads are matched to
-+// FST data ranges (by the original names) to know which level is actually loading, and a return to
-+// the hub after a run level advances the run.
++// FST data ranges (by the original names) to know which level is actually loading. A level counts
++// as cleared when the game's level state shows the results screen; returning to the hub after a
++// clear advances the run, returning without one (quitting) ends it.
 +//
 +// Threads: OnFrameEnd and OnDiscRead run on the CPU thread; GetStatus may be called from any
 +// thread; the state-changed callback runs on the host thread. Everything is guarded by m_mutex.
@@ -600,6 +634,8 @@ index 0000000..73bff17
 +{
 +  bool show = false;      // game recognised and file table read
 +  bool complete = false;  // all loops finished
++  bool over = false;      // quit a level: run ended
++  std::string over_level; // level that was quit
 +  bool in_level = false;  // currently inside the run level
 +  int loop = 1;           // 1-based
 +  int level = 1;          // 1-based
@@ -659,6 +695,8 @@ index 0000000..73bff17
 +
 +  // Run progress.
 +  bool m_complete = false;
++  bool m_over = false;
++  bool m_cleared = false;  // results screen seen in the current run level
 +  int m_loop = 0;   // 0-based
 +  int m_level = 0;  // 0-based
 +  bool m_in_level = false;
@@ -2513,10 +2551,10 @@ index 3e0cf09..0b232a7 100644
  
 diff --git a/Source/Core/VideoCommon/RoguelikeDevOverlay.cpp b/Source/Core/VideoCommon/RoguelikeDevOverlay.cpp
 new file mode 100644
-index 0000000..ffa7662
+index 0000000..e81997b
 --- /dev/null
 +++ b/Source/Core/VideoCommon/RoguelikeDevOverlay.cpp
-@@ -0,0 +1,219 @@
+@@ -0,0 +1,225 @@
 +// Copyright 2026 Dolphin Emulator Project
 +// SPDX-License-Identifier: GPL-2.0-or-later
 +
@@ -2597,6 +2635,12 @@ index 0000000..ffa7662
 +    {
 +      ColoredText(COLOR_ERROR, "Roguelike: level files not found");
 +      ColoredText(COLOR_DIM, run.error);
++    }
++    else if (run.over)
++    {
++      ColoredText(COLOR_ERROR, "RUN OVER");
++      ColoredText(COLOR_DIM, fmt::format("Quit {} on loop {}", run.over_level, run.loop));
++      ColoredText(COLOR_DIM, "Restart the game for a new run");
 +    }
 +    else if (run.complete)
 +    {
