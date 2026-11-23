@@ -12,6 +12,8 @@ Rules (labels come from session.txt; use "#3" to refer to capture index 3 instea
   a!=b       value changed between a and b
   a==123     value at a equals 123 (int or float)
   a>=0  a<=1000  a!=0   compare one capture with a constant
+  a<=b  a>=b             value didn't go up / didn't go down between captures
+  a~b                    values are within --tol of each other (e.g. positions)
 
 Example (gold goes up twice, stays put while standing still):
   snapshot_search.py CAPTURE_DIR --type u32 --rule "start<gold_1" --rule "gold_1<gold_2" \
@@ -90,7 +92,7 @@ def load_session(folder: Path) -> list[Snapshot]:
     return snaps
 
 
-RULE_RE = re.compile(r"^\s*([^<>=!\s]+)\s*(==|!=|>=|<=|>|<|=)\s*(.+?)\s*$")
+RULE_RE = re.compile(r"^\s*([^<>=!~\s]+)\s*(==|!=|>=|<=|>|<|=|~)\s*(.+?)\s*$")
 
 
 @dataclass
@@ -111,9 +113,9 @@ def parse_rule(text: str) -> Rule:
         constant = float(int(right, 0)) if re.fullmatch(r"-?(0x[0-9a-fA-F]+|\d+)", right) else float(right)
     except ValueError:
         constant = None
-    if constant is None and op in ("==", ">=", "<="):
-        raise ValueError(f"Rule {text!r}: '{op}' needs a number on the right")
-    if constant is not None and op in ("=", ">", "<"):
+    if constant is None and op == "==":
+        raise ValueError(f"Rule {text!r}: '==' needs a number on the right (use '=' between captures)")
+    if constant is not None and op in ("=", ">", "<", "~"):
         raise ValueError(f"Rule {text!r}: use '==', '!=', '>=', '<=' with a number")
     return Rule(left, op, right, constant)
 
@@ -138,7 +140,7 @@ def view(mem: np.ndarray, dtype: str, size: int) -> np.ndarray:
     return mem[:usable].view(dtype)
 
 
-def search(snaps: list[Snapshot], rules: list[Rule], type_name: str, region: str) -> np.ndarray:
+def search(snaps: list[Snapshot], rules: list[Rule], type_name: str, region: str, tol: float = 1.0) -> np.ndarray:
     dtype, size = TYPES[type_name]
     mask = None
     cache: dict[int, np.ndarray] = {}
@@ -158,7 +160,10 @@ def search(snaps: list[Snapshot], rules: list[Rule], type_name: str, region: str
         else:
             b = values(find_snapshot(snaps, rule.right))
             with np.errstate(invalid="ignore"):
-                cond = {"<": a < b, ">": a > b, "=": a == b, "!=": a != b}[rule.op]
+                if rule.op == "~":
+                    cond = np.abs(a.astype(np.float64) - b.astype(np.float64)) <= tol
+                else:
+                    cond = {"<": a < b, ">": a > b, "=": a == b, "!=": a != b, "<=": a <= b, ">=": a >= b}[rule.op]
         if type_name == "f32":
             cond &= np.isfinite(a)
         mask = cond if mask is None else (mask & cond)
@@ -180,6 +185,7 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--rule", action="append", default=[], help="see above; repeatable")
     p.add_argument("--region", choices=["mem1", "mem2", "both"], default="both")
     p.add_argument("--limit", type=int, default=40, help="candidates to print")
+    p.add_argument("--tol", type=float, default=1.0, help="tolerance for the a~b rule")
     p.add_argument("--watch-out", type=Path, help="write the top candidates as watch.txt lines")
     p.add_argument("--list", action="store_true", help="list the captures and exit")
     args = p.parse_args(argv)
@@ -197,7 +203,7 @@ def main(argv: list[str] | None = None) -> int:
     results = []
     for region in (["mem1", "mem2"] if args.region == "both" else [args.region]):
         base = MEM1_BASE if region == "mem1" else MEM2_BASE
-        offsets = search(snaps, rules, args.type, region)
+        offsets = search(snaps, rules, args.type, region, args.tol)
         for off in offsets:
             results.append((region, base + int(off), int(off)))
 
